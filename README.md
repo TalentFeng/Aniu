@@ -1,6 +1,13 @@
 <div align="center">
-# Aniu
+
+# ccgui
+
+<img width="120" alt="Image" src="./icon.png" />
+
+![][github-contributors-shield] ![][github-forks-shield] ![][github-stars-shield] ![][github-issues-shield]
+
 </div>
+
 Aniu 是一个面向 A 股 / 港股场景的智能分析与模拟交易系统，提供以下能力：
 
 - AI 分析任务执行与结果展示
