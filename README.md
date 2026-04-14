@@ -275,7 +275,8 @@ CORS_ALLOW_ORIGINS=https://your-domain.com
 
 - 当你向 `main` 分支推送代码时，会自动构建并发布 `ghcr.io/anacondakc/aniu:latest`
 - 同时会附带一个基于提交 SHA 的镜像标签，便于回滚和定位
-- 当你推送形如 `v1.0.0` 的 Git tag 时，也会自动发布同名版本标签
+- 当你推送形如 `v1.0.0` 的 Git tag 时，会自动发布 `v1.0.0` 和 `1.0.0` 两个版本镜像标签
+- 推送版本 tag 后，会自动创建对应的 GitHub Release
 - `docker-compose.yml` 默认会拉取 `ghcr.io/anacondakc/aniu:${ANIU_IMAGE_TAG:-latest}`
 
 拉取示例：
@@ -283,3 +284,23 @@ CORS_ALLOW_ORIGINS=https://your-domain.com
 ```bash
 docker pull ghcr.io/anacondakc/aniu:latest
 ```
+
+### 版本发布
+
+如果你要正式发布一个版本，推荐按下面步骤执行：
+
+1. 确认要发布的提交已经推送到 `main`
+2. 创建版本 tag，例如：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+3. GitHub Actions 会自动完成：
+
+- 发布 `ghcr.io/anacondakc/aniu:v0.1.0`
+- 发布 `ghcr.io/anacondakc/aniu:0.1.0`
+- 创建对应的 GitHub Release
+
+如果你要部署指定版本，可以把 `.env.docker` 中的 `ANIU_IMAGE_TAG` 改成 `v0.1.0`。
