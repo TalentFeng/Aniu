@@ -1,10 +1,8 @@
 <div align="center">
 
-# ccgui
+# Aniu
 
 <img width="120" alt="Image" src="./icon.png" />
-
-![][github-contributors-shield] ![][github-forks-shield] ![][github-stars-shield] ![][github-issues-shield]
 
 </div>
 
