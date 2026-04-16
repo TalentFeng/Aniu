@@ -230,7 +230,7 @@ docker compose down
 
 - 前端在构建阶段打包后复制到 `/app/static`
 - 后端通过 FastAPI 同时提供 API 和静态前端页面
-- 默认 SQLite 数据库存放在 `/app/data/aniu.db`
+- 默认 SQLite 数据库存放在 `/app/data/aniu.sqlite3`
 - 容器内置健康检查：
 
 ```text
@@ -286,8 +286,14 @@ curl -X POST http://127.0.0.1:8000/api/aniu/login \
 
 ## 数据与持久化
 
-- 默认数据库：`/app/data/aniu.db`
+- 默认数据库：`/app/data/aniu.sqlite3`
 - `docker-compose.yml` 默认挂载宿主机目录：`./data:/app/data`
+
+兼容说明：
+
+- 如果你是从旧版本升级而来，宿主机目录中可能已经存在旧数据库文件：`./data/aniu.db`
+- 当前版本会优先识别并继续使用这个旧文件，避免升级后看起来像“数据和设置丢失”
+- 如果你显式设置了 `SQLITE_DB_PATH`，则会以你设置的路径为准
 
 如果使用 `docker run`，请务必挂载数据卷或宿主机目录，否则容器重建后 SQLite 数据会丢失。
 

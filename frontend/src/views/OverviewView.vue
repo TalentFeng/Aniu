@@ -9,7 +9,7 @@
               </div>
               <div class="panel-head-actions">
                 <button
-                  class="button ghost small overview-refresh-button"
+                  class="button ghost small soft-header-button overview-refresh-button"
                   :class="{ 'is-loading': accountRefreshing }"
                   :disabled="accountRefreshing || !canManualRefreshAccount"
                   @click="handleManualRefresh"
@@ -94,71 +94,59 @@
                 <h2>持仓情况</h2>
                 <p class="section-kicker">Positions</p>
               </div>
-              <div class="panel-head-actions">
-                <button
-                  class="button ghost small overview-refresh-button"
-                  :class="{ 'is-loading': accountRefreshing }"
-                  :disabled="accountRefreshing || !canManualRefreshAccount"
-                  @click="handleManualRefresh"
-                >
-                  {{ canManualRefreshAccount ? '刷新' : `${accountRefreshCooldownText}后可刷新` }}
-                </button>
-              </div>
             </div>
             <div
-              class="positions-table-wrap"
-              :class="{ 'table-wrap-scrollable': hasPositionOverflow }"
+              class="positions-surface"
               v-if="displayPositions.length"
             >
-              <table class="positions-table">
-                <thead>
-                  <tr>
-                    <th>名称 / 代码</th>
-                    <th>持仓市值</th>
-                    <th>持仓股数 / 可卖股数</th>
-                    <th>当日盈亏 / 当日收益率</th>
-                    <th>总盈亏 / 总收益率</th>
-                    <th>当前价 / 成本价</th>
-                    <th>仓位占比</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="pos in displayPositions" :key="pos.symbol">
-                    <td>
-                      <div class="position-cell-main">
-                        <strong class="position-name">{{ pos.name }}</strong>
-                        <span class="position-symbol">{{ pos.symbol }}</span>
-                      </div>
-                    </td>
-                    <td>{{ formatMoney(pos.amount) }}</td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatVolume(pos.volume) }}</span>
-                        <span class="metric-sub">可卖 {{ formatVolume(pos.available_volume) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span :class="profitClass(pos.day_profit)">{{ formatSignedMoney(pos.day_profit) }}</span>
-                        <span class="metric-sub" :class="profitClass(pos.day_profit_ratio)">{{ formatPercent(pos.day_profit_ratio) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span :class="profitClass(pos.profit)">{{ formatSignedMoney(pos.profit) }}</span>
-                        <span class="metric-sub" :class="profitClass(pos.profit_ratio)">{{ formatPercent(pos.profit_ratio) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatMoney(pos.current_price) }}</span>
-                        <span class="metric-sub">{{ formatMoney(pos.cost_price) }}</span>
-                      </div>
-                    </td>
-                    <td>{{ getPositionRatioText(pos.position_ratio) }}</td>
-                  </tr>
-                </tbody>
-              </table>
+              <div class="positions-grid-header">
+                <div class="positions-grid-row positions-grid-row-head">
+                  <div class="positions-grid-cell positions-grid-cell-primary overview-grid-head-cell">名称 / 代码</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">持仓市值</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">持仓股数 / 可卖股数</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">当日盈亏 / 当日收益率</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">总盈亏 / 总收益率</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">当前价 / 成本价</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">仓位占比</div>
+                </div>
+              </div>
+
+              <div class="positions-grid-body">
+                <div class="positions-grid-row" v-for="pos in displayPositions" :key="pos.symbol">
+                  <div class="positions-grid-cell positions-grid-cell-primary">
+                    <div class="position-cell-main">
+                      <strong class="position-name">{{ pos.name }}</strong>
+                      <span class="position-symbol">{{ pos.symbol }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">{{ formatMoney(pos.amount) }}</div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatVolume(pos.volume) }}</span>
+                      <span class="metric-sub">可卖 {{ formatVolume(pos.available_volume) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span :class="profitClass(pos.day_profit)">{{ formatSignedMoney(pos.day_profit) }}</span>
+                      <span class="metric-sub" :class="profitClass(pos.day_profit_ratio)">{{ formatPercent(pos.day_profit_ratio) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span :class="profitClass(pos.profit)">{{ formatSignedMoney(pos.profit) }}</span>
+                      <span class="metric-sub" :class="profitClass(pos.profit_ratio)">{{ formatPercent(pos.profit_ratio) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatMoney(pos.current_price) }}</span>
+                      <span class="metric-sub">{{ formatMoney(pos.cost_price) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">{{ getPositionRatioText(pos.position_ratio) }}</div>
+                </div>
+              </div>
             </div>
             <div v-else class="empty-state">
               <p>{{ errorMessage || '账户接口暂未返回真实持仓数据。请检查后端账户接口或先执行一次任务刷新账户快照。' }}</p>
@@ -171,66 +159,54 @@
                 <h2>交易信息</h2>
                 <p class="section-kicker">Trades</p>
               </div>
-              <div class="panel-head-actions">
-                <button
-                  class="button ghost small overview-refresh-button"
-                  :class="{ 'is-loading': accountRefreshing }"
-                  :disabled="accountRefreshing || !canManualRefreshAccount"
-                  @click="handleManualRefresh"
-                >
-                  {{ canManualRefreshAccount ? '刷新' : `${accountRefreshCooldownText}后可刷新` }}
-                </button>
-              </div>
             </div>
             <div
-              class="positions-table-wrap"
-              :class="{ 'trade-summary-table-wrap-scrollable': hasTradeSummaryOverflow }"
+              class="positions-surface"
               v-if="displayTradeSummaries.length"
             >
-              <table class="positions-table trade-summary-table">
-                <thead>
-                  <tr>
-                    <th>名称 / 代码</th>
-                    <th>买入时间</th>
-                    <th>卖出时间</th>
-                    <th>成交股数</th>
-                    <th>卖出均价 / 买入均价</th>
-                    <th>卖出金额 / 买入金额</th>
-                    <th>收益 / 收益率</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="trade in displayTradeSummaries" :key="`${trade.symbol}-${trade.closed_at || '--'}`">
-                    <td>
-                      <div class="position-cell-main">
-                        <strong class="position-name">{{ trade.name }}</strong>
-                        <span class="position-symbol">{{ trade.symbol }}</span>
-                      </div>
-                    </td>
-                    <td>{{ formatMinuteTime(trade.opened_at) }}</td>
-                    <td>{{ formatMinuteTime(trade.closed_at) }}</td>
-                    <td>{{ formatVolume(trade.volume) }}</td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatMoney(trade.sell_price) }}</span>
-                        <span class="metric-sub">{{ formatMoney(trade.buy_price) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatMoney(trade.sell_amount) }}</span>
-                        <span class="metric-sub">{{ formatMoney(trade.buy_amount) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span :class="profitClass(trade.profit)">{{ formatSignedMoney(trade.profit) }}</span>
-                        <span class="metric-sub" :class="profitClass(trade.profit_ratio)">{{ formatPercent(trade.profit_ratio) }}</span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+              <div class="positions-grid-header">
+                <div class="trade-grid-row trade-grid-row-head">
+                  <div class="positions-grid-cell positions-grid-cell-primary overview-grid-head-cell">名称 / 代码</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">买入时间</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">卖出时间</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">成交股数</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">卖出均价 / 买入均价</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">卖出金额 / 买入金额</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">收益 / 收益率</div>
+                </div>
+              </div>
+
+              <div class="positions-grid-body">
+                <div class="trade-grid-row" v-for="trade in displayTradeSummaries" :key="`${trade.symbol}-${trade.closed_at || '--'}`">
+                  <div class="positions-grid-cell positions-grid-cell-primary">
+                    <div class="position-cell-main">
+                      <strong class="position-name">{{ trade.name }}</strong>
+                      <span class="position-symbol">{{ trade.symbol }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell trade-time-cell">{{ formatMinuteTime(trade.opened_at) }}</div>
+                  <div class="positions-grid-cell trade-time-cell">{{ formatMinuteTime(trade.closed_at) }}</div>
+                  <div class="positions-grid-cell">{{ formatVolume(trade.volume) }}</div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatMoney(trade.sell_price) }}</span>
+                      <span class="metric-sub">{{ formatMoney(trade.buy_price) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatMoney(trade.sell_amount) }}</span>
+                      <span class="metric-sub">{{ formatMoney(trade.buy_amount) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span :class="profitClass(trade.profit)">{{ formatSignedMoney(trade.profit) }}</span>
+                      <span class="metric-sub" :class="profitClass(trade.profit_ratio)">{{ formatPercent(trade.profit_ratio) }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
             <div v-else class="empty-state">
               <p>当前还没有可展示的完整交易闭环。买入后全部卖出的股票会展示在这里。</p>
@@ -243,67 +219,55 @@
                 <h2>委托信息</h2>
                 <p class="section-kicker">Orders</p>
               </div>
-              <div class="panel-head-actions">
-                <button
-                  class="button ghost small overview-refresh-button"
-                  :class="{ 'is-loading': accountRefreshing }"
-                  :disabled="accountRefreshing || !canManualRefreshAccount"
-                  @click="handleManualRefresh"
-                >
-                  {{ canManualRefreshAccount ? '刷新' : `${accountRefreshCooldownText}后可刷新` }}
-                </button>
-              </div>
             </div>
             <div
-              class="positions-table-wrap"
-              :class="{ 'orders-table-wrap-scrollable': hasOrderOverflow }"
+              class="positions-surface"
               v-if="displayOrders.length"
             >
-              <table class="positions-table orders-table">
-                <thead>
-                  <tr>
-                    <th>名称 / 代码</th>
-                    <th>委托时间</th>
-                    <th>买卖方向</th>
-                    <th>委托价格 / 数量</th>
-                    <th>成交价格 / 数量</th>
-                    <th>委托状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="order in displayOrders" :key="order.order_id">
-                    <td>
-                      <div class="position-cell-main">
-                        <strong class="position-name">{{ order.name }}</strong>
-                        <span class="position-symbol">{{ order.symbol }}</span>
-                      </div>
-                    </td>
-                    <td>{{ order.order_time || '--' }}</td>
-                    <td>
-                      <span class="order-side" :class="order.side === 'buy' ? 'profit-up' : 'profit-down'">
-                        {{ order.side_text }}
-                      </span>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatMoney(order.order_price) }}</span>
-                        <span class="metric-sub">{{ formatVolume(order.order_quantity) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <div class="position-cell-stack">
-                        <span>{{ formatMoney(order.filled_price) }}</span>
-                        <span class="metric-sub">{{ formatVolume(order.filled_quantity) }}</span>
-                      </div>
-                    </td>
-                    <td>
-                      <span class="order-status" :class="getOrderStatusClass(order.status_text)">
-                        {{ order.status_text || '--' }}
-                      </span>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+              <div class="positions-grid-header">
+                <div class="orders-grid-row orders-grid-row-head">
+                  <div class="positions-grid-cell positions-grid-cell-primary overview-grid-head-cell">名称 / 代码</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">委托时间</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">买卖方向</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">委托价格 / 数量</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">成交价格 / 数量</div>
+                  <div class="positions-grid-cell overview-grid-head-cell">委托状态</div>
+                </div>
+              </div>
+
+              <div class="positions-grid-body">
+                <div class="orders-grid-row" v-for="order in displayOrders" :key="order.order_id">
+                  <div class="positions-grid-cell positions-grid-cell-primary">
+                    <div class="position-cell-main">
+                      <strong class="position-name">{{ order.name }}</strong>
+                      <span class="position-symbol">{{ order.symbol }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">{{ order.order_time || '--' }}</div>
+                  <div class="positions-grid-cell">
+                    <span class="order-side" :class="order.side === 'buy' ? 'profit-up' : 'profit-down'">
+                      {{ order.side_text }}
+                    </span>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatMoney(order.order_price) }}</span>
+                      <span class="metric-sub">{{ formatVolume(order.order_quantity) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <div class="position-cell-stack">
+                      <span>{{ formatMoney(order.filled_price) }}</span>
+                      <span class="metric-sub">{{ formatVolume(order.filled_quantity) }}</span>
+                    </div>
+                  </div>
+                  <div class="positions-grid-cell">
+                    <span class="order-status" :class="getOrderStatusClass(order.status_text)">
+                      {{ order.status_text || '--' }}
+                    </span>
+                  </div>
+                </div>
+              </div>
             </div>
             <div v-else class="empty-state">
               <p>当前没有可展示的委托记录。完成一次买入、卖出或撤单后，委托信息会显示在这里。</p>
@@ -484,9 +448,6 @@ const { account, runtimeOverview, errorMessage, accountRefreshing, canManualRefr
 const displayPositions = computed(() => account.value.positions.filter((position) => (position.volume ?? 0) > 0))
 const displayOrders = computed(() => account.value.orders)
 const displayTradeSummaries = computed(() => account.value.trade_summaries)
-const hasPositionOverflow = computed(() => displayPositions.value.length > 5)
-const hasOrderOverflow = computed(() => displayOrders.value.length > 5)
-const hasTradeSummaryOverflow = computed(() => displayTradeSummaries.value.length > 5)
 const tradeSuccessRate = computed(() => {
   const total = displayTradeSummaries.value.length
   if (total === 0) {
@@ -616,6 +577,7 @@ onMounted(async () => {
   cooldownTimer = window.setInterval(() => {
     store.touchAccountRefreshTick()
   }, 60 * 1000)
+
 })
 
 onUnmounted(() => {

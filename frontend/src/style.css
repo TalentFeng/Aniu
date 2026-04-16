@@ -451,17 +451,21 @@ textarea {
 }
 
 .positions-panel {
-  min-height: 533px;
+  min-height: 545px;
+  height: 545px;
+  background: rgba(10, 16, 28, 0.84);
+  border: 1px solid rgba(145, 170, 214, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .orders-panel {
-  min-height: 549.17px;
-  height: 549.17px;
+  min-height: 545px;
+  height: 545px;
 }
 
 .trade-summary-panel {
-  min-height: 549.17px;
-  height: 549.17px;
+  min-height: 545px;
+  height: 545px;
 }
 
 .positions-list {
@@ -504,118 +508,182 @@ textarea {
   background: rgba(15, 23, 42, 0.5);
 }
 
-.positions-table-wrap {
-  margin-top: 16px;
-  overflow-x: auto;
-  border: 1px solid rgba(145, 170, 214, 0.12);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.28);
-  scrollbar-width: thin;
-  scrollbar-color: rgba(145, 170, 214, 0.32) rgba(15, 23, 42, 0.18);
-  flex: 1;
+.positions-surface {
+  flex: 1 1 auto;
   min-height: 0;
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
+  border-radius: 18px;
+  border: 1px solid rgba(145, 170, 214, 0.14);
+  background: rgba(11, 18, 32, 0.82);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  overflow: hidden;
 }
 
-.positions-panel .positions-table-wrap,
-.orders-panel .positions-table-wrap,
-.trade-summary-panel .positions-table-wrap {
-  width: 100%;
+.positions-grid-header {
+  height: 45px;
+  background: rgba(9, 14, 24, 0.96);
+  border-bottom: 1px solid rgba(145, 170, 214, 0.08);
 }
 
-.table-wrap-scrollable {
-  overflow-y: auto;
-  max-height: 288px;
-}
-
-.orders-table-wrap-scrollable {
-  overflow-y: auto;
-  flex: 1 1 auto;
+.positions-grid-body {
+  flex: 1 1 0;
   min-height: 0;
-}
-
-.trade-summary-table-wrap-scrollable {
   overflow-y: auto;
-  flex: 1 1 auto;
-  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(145, 170, 214, 0.16) transparent;
 }
 
-.positions-table-wrap::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+.positions-grid-body::-webkit-scrollbar {
+  width: 2px;
 }
 
-.positions-table-wrap::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.18);
+.positions-grid-body::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
-.positions-table-wrap::-webkit-scrollbar-thumb {
-  background: rgba(145, 170, 214, 0.32);
+.positions-grid-body::-webkit-scrollbar-button:start:decrement,
+.positions-grid-body::-webkit-scrollbar-button:end:increment,
+.positions-grid-body::-webkit-scrollbar-button:single-button,
+.positions-grid-body::-webkit-scrollbar-button:double-button,
+.positions-grid-body::-webkit-scrollbar-button:vertical:start:decrement,
+.positions-grid-body::-webkit-scrollbar-button:vertical:end:increment {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
+.positions-grid-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.positions-grid-body::-webkit-scrollbar-thumb {
+  background: rgba(145, 170, 214, 0.18);
   border-radius: 999px;
 }
 
-.positions-table-wrap::-webkit-scrollbar-thumb:hover {
-  background: rgba(145, 170, 214, 0.48);
+.positions-grid-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(145, 170, 214, 0.32);
 }
 
-.positions-table {
-  width: 100%;
-  min-width: 980px;
-  border-collapse: collapse;
-  align-self: auto;
+.positions-grid-row {
+  display: grid;
+  grid-template-columns:
+    150px
+    minmax(130px, 0.92fr)
+    minmax(180px, 1.08fr)
+    minmax(180px, 1.08fr)
+    minmax(180px, 1.08fr)
+    minmax(150px, 0.96fr)
+    minmax(110px, 0.72fr);
 }
 
-.positions-table th,
-.positions-table td {
+.positions-grid-row-head {
+  min-height: var(--overview-table-head-height);
+}
+
+.positions-grid-body .positions-grid-row {
+  min-height: var(--overview-table-row-height);
+}
+
+.positions-grid-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 14px 16px;
   border-bottom: 1px solid rgba(145, 170, 214, 0.08);
-  vertical-align: middle;
-}
-
-.positions-table th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: rgba(9, 14, 24, 0.96);
-  color: #7a90b0;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  text-align: center;
-}
-
-.positions-panel .positions-table thead tr,
-.trade-summary-panel .positions-table thead tr,
-.orders-panel .positions-table thead tr {
-  height: var(--overview-table-head-height);
-}
-
-.positions-table th:first-child,
-.positions-table td:first-child {
-  text-align: left;
-}
-
-.positions-table td {
   color: #eef4ff;
   font-size: 16px;
   text-align: center;
 }
 
-.positions-table tbody tr:hover {
+.overview-grid-head-cell {
+  color: #94aac8;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  justify-content: center;
+  text-align: center;
+}
+
+.overview-grid-head-cell.positions-grid-cell-primary {
+  justify-content: center;
+  text-align: center;
+}
+
+.positions-grid-body .positions-grid-row:hover {
   background: rgba(81, 180, 255, 0.05);
 }
 
-.positions-panel .positions-table tbody tr,
-.trade-summary-panel .positions-table tbody tr,
-.orders-panel .positions-table tbody tr {
-  height: var(--overview-table-row-height);
+.positions-grid-cell-primary {
+  justify-content: center;
+  text-align: center;
 }
 
-.positions-table tbody tr:last-child td {
+.positions-surface .position-name {
+  font-size: 17px;
+}
+
+.positions-surface .position-symbol,
+.positions-surface .metric-sub {
+  font-size: 13px;
+}
+
+.positions-grid-body .positions-grid-row:last-child .positions-grid-cell {
   border-bottom: none;
+}
+
+.trade-grid-row {
+  display: grid;
+  grid-template-columns:
+    150px
+    minmax(170px, 1fr)
+    minmax(170px, 1fr)
+    minmax(130px, 0.86fr)
+    minmax(170px, 1.02fr)
+    minmax(170px, 1.02fr)
+    minmax(170px, 1.02fr);
+}
+
+.orders-grid-row {
+  display: grid;
+  grid-template-columns:
+    150px
+    minmax(150px, 0.95fr)
+    minmax(130px, 0.8fr)
+    minmax(170px, 1.02fr)
+    minmax(170px, 1.02fr)
+    minmax(150px, 0.9fr);
+}
+
+.trade-grid-row-head,
+.orders-grid-row-head {
+  min-height: var(--overview-table-head-height);
+}
+
+.positions-grid-body .trade-grid-row,
+.positions-grid-body .orders-grid-row {
+  min-height: var(--overview-table-row-height);
+}
+
+.positions-grid-body .trade-grid-row:hover,
+.positions-grid-body .orders-grid-row:hover {
+  background: rgba(81, 180, 255, 0.05);
+}
+
+.positions-grid-body .trade-grid-row:last-child .positions-grid-cell,
+.positions-grid-body .orders-grid-row:last-child .positions-grid-cell {
+  border-bottom: none;
+}
+
+.trade-time-cell {
+  white-space: nowrap;
 }
 
 .position-cell-main,
@@ -626,37 +694,17 @@ textarea {
   align-items: center;
 }
 
-.positions-table td:first-child .position-cell-main {
+.positions-grid-cell-primary .position-cell-main {
   align-items: flex-start;
 }
 
-.positions-table .position-name {
+.positions-surface .position-name {
   font-size: 17px;
 }
 
-.positions-table .position-symbol,
-.positions-table .metric-sub {
+.positions-surface .position-symbol,
+.positions-surface .metric-sub {
   font-size: 13px;
-}
-
-.orders-table {
-  min-width: 860px;
-}
-
-.trade-summary-table {
-  min-width: 920px;
-}
-
-.orders-panel .positions-table-wrap {
-  height: var(--overview-table-fixed-height);
-  flex: 1 1 0;
-  overflow-y: auto;
-}
-
-.trade-summary-panel .positions-table-wrap {
-  height: var(--overview-table-fixed-height);
-  flex: 1 1 0;
-  overflow-y: auto;
 }
 
 .order-side {
@@ -749,14 +797,6 @@ textarea {
 .metric-sub {
   font-size: 11px;
   color: #7a90b0;
-}
-
-/* 响应式：小屏幕时调整 */
-@media (max-width: 900px) {
-  .positions-table th,
-  .positions-table td {
-    padding: 12px 14px;
-  }
 }
 
 /* 运行总览样式 */
@@ -1077,12 +1117,26 @@ textarea {
 }
 
 .overview-refresh-button {
-  min-width: 108px;
-  padding: 7px 12px;
+  min-width: 78px;
+  padding: 6px 10px;
   font-size: 12px;
   line-height: 1.2;
   justify-content: center;
   white-space: nowrap;
+}
+
+.button.soft-header-button {
+  border-radius: 10px;
+}
+
+.button.ghost.soft-header-button {
+  background: rgba(9, 14, 24, 0.96);
+  color: #94aac8;
+  border: 1px solid rgba(145, 170, 214, 0.14);
+}
+
+.button.ghost.soft-header-button:hover:not(:disabled) {
+  background: rgba(12, 18, 30, 0.98);
 }
 
 .head-main {
@@ -1176,22 +1230,9 @@ textarea {
   position: relative;
   display: inline-flex;
   align-items: center;
-  min-height: 28px;
-  padding: 4px 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(145, 170, 214, 0.16);
-  background: rgba(15, 23, 42, 0.34);
-  color: #c9d6ea;
+  min-height: 30px;
+  padding: 6px 10px;
   font-size: 11px;
-  cursor: pointer;
-  transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
-}
-
-.date-input-trigger:hover {
-  border-color: rgba(145, 170, 214, 0.28);
-  background: rgba(15, 23, 42, 0.5);
-  color: #e5eefc;
-  transform: translateY(-1px);
 }
 
 .date-input-trigger:focus-visible {

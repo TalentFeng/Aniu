@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     app_name: str = "Aniu"
     api_prefix: str = "/api/aniu"
     sqlite_db_path: Path = Field(
-        default=Path("./data/aniu.db"), alias="SQLITE_DB_PATH"
+        default=Path("./data/aniu.sqlite3"), alias="SQLITE_DB_PATH"
     )
 
     mx_apikey: str | None = Field(default=None, alias="MX_APIKEY")
@@ -82,4 +82,13 @@ def get_settings() -> Settings:
     settings = Settings()
     if not settings.sqlite_db_path.is_absolute():
         settings.sqlite_db_path = Path.cwd() / settings.sqlite_db_path
+
+    configured_db_path = settings.sqlite_db_path
+    default_db_path = Path.cwd() / "data" / "aniu.sqlite3"
+    legacy_db_path = Path.cwd() / "data" / "aniu.db"
+    using_default_relative_path = configured_db_path == default_db_path
+    # Backward-compatible fallback for older deployments that persisted the
+    # SQLite file as ./data/aniu.db before the default name was unified.
+    if using_default_relative_path and not configured_db_path.exists() and legacy_db_path.exists():
+        settings.sqlite_db_path = legacy_db_path
     return settings

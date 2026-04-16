@@ -61,7 +61,7 @@
                 <div class="group-label">
                   <span class="label-text">历史</span>
                   <div class="group-label-meta">
-                    <button type="button" class="date-input-trigger" @click="openHistoryDatePicker">
+                    <button type="button" class="button ghost small soft-header-button date-input-trigger" @click="openHistoryDatePicker">
                       <span class="date-input-value">{{ historyDateDisplay }}</span>
                     </button>
                     <input
