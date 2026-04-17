@@ -354,23 +354,4 @@ CORS_ALLOW_ORIGINS=https://your-domain.com
 ```bash
 docker pull ghcr.io/anacondakc/aniu:latest
 ```
-
-### 版本发布
-
-如果你要正式发布一个版本，推荐按下面步骤执行：
-
-1. 确认要发布的提交已经推送到 `main`
-2. 创建版本 tag，例如：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-3. GitHub Actions 会自动完成：
-
-- 发布 `ghcr.io/anacondakc/aniu:v0.1.0`
-- 发布 `ghcr.io/anacondakc/aniu:0.1.0`
-- 创建对应的 GitHub Release
-
-如果你要部署指定版本，可以把 `.env.docker` 中的 `ANIU_IMAGE_TAG` 改成 `v0.1.0`。
+致敬感谢：此项目开发使用了公益站，感谢 LINUX DO 社区 https://linux.do/t/topic/1987329
