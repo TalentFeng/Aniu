@@ -1,6 +1,6 @@
 <div align="center">
 
-# Aniu——科技牛牛带你狠狠干A股（GPT版）
+# Aniu——科技牛牛带你狠狠干A股
 
 <img width="120" alt="Aniu icon" src="./frontend/public/aniu.ico" />
 
