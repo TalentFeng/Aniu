@@ -1,4 +1,4 @@
-import { reactive, ref } from 'vue'
+import { reactive } from 'vue'
 
 import type { ScheduleConfig } from '@/types'
 
@@ -95,11 +95,11 @@ function normalizeSectionTime(section: ScheduleKey, hour: number, minute: number
 }
 
 const defaultState = (): ScheduleFormState => ({
-  preMarket: { enabled: false, hour: 8, minute: 0, prompt: '请分析今日市场情况和持仓情况，包括宏观经济数据、行业动态、重要新闻等，并提供今日可能的市场走势预测，为接下来的决策和交易做好准备。' },
-  postMarket: { enabled: false, hour: 15, minute: 30, prompt: '请对今日市场和交易操作进行全面复盘，分析主要指数表现、板块涨跌、热门个股、成交量变化等，并总结今日市场特点和明日可能的走势。' },
-  midday: { enabled: false, hour: 12, minute: 0, prompt: '请对上午市场和交易操作进行复盘，分析上午市场的主要变化、热点板块、资金流向等，并对下午市场可能的走势进行预测，为接下来的决策和交易做好准备。' },
-  morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你必须像主动型交易员一样思考，在可承受风险下最大化收益，你可以进行一切交易操作，包括但不限于建仓、减仓、清仓、换股、做T、锁定利润、回避风险、空仓等待等。' },
-  afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你必须像主动型交易员一样思考，在可承受风险下最大化收益，你可以进行一切交易操作，包括但不限于建仓、减仓、清仓、换股、做T、锁定利润、回避风险、空仓等待等。' },
+  preMarket: { enabled: false, hour: 8, minute: 0, prompt: '你正在执行盘前分析任务，请分析今日市场情况和持仓情况，做好今日市场走势预测，为你决策交易做好准备。' },
+  postMarket: { enabled: false, hour: 15, minute: 30, prompt: '你正在执行收盘分析任务，请对今日市场和交易操作进行全面复盘，总结今日市场和明日可能的走势。' },
+  midday: { enabled: false, hour: 12, minute: 0, prompt: '你正在执行午间复盘任务，请对上午市场和交易操作进行复盘，做好下午市场走势预测，为你决策交易做好准备。' },
+  morning: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
+  afternoon: { enabled: true, runCount: 2, prompt: '你正在执行盘中交易操作，你的唯一目标是追求收益最大化。' },
 })
 
 function parseCron(cronExpression: string) {
@@ -153,7 +153,6 @@ function getSessionTimeLabels(session: SessionKey, runCount: number) {
 }
 
 export function useScheduleForm() {
-  const timeErrors = ref<Record<string, boolean>>({})
   const scheduleSettings = reactive<ScheduleFormState>(defaultState())
 
   function syncFromSchedules(schedules: ScheduleLike[]) {
@@ -220,15 +219,9 @@ export function useScheduleForm() {
     return [...fixedPayload, ...sessionPayload]
   }
 
-  function validateTime(section: ScheduleKey, field: 'hour' | 'minute') {
-    void field
-    timeErrors.value[section] = false
-  }
-
   function setFixedTaskTime(section: ScheduleKey, option: FixedTaskTimeOption) {
     scheduleSettings[section].hour = option.hour
     scheduleSettings[section].minute = option.minute
-    timeErrors.value[section] = false
   }
 
   function autoResizeTextarea(event: Event) {
@@ -246,13 +239,11 @@ export function useScheduleForm() {
   }
 
   return {
-    timeErrors,
     scheduleSettings,
     fixedTaskTimeOptions: FIXED_TASK_TIME_OPTIONS,
     runCountOptions: RUN_COUNT_OPTIONS,
     syncFromSchedules,
     buildPayload,
-    validateTime,
     setFixedTaskTime,
     autoResizeTextarea,
     getMorningRunTimes,

@@ -18,6 +18,7 @@ LABEL org.opencontainers.image.licenses="MIT"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    MALLOC_ARENA_MAX=2 \
     APP_ENV=docker
 
 WORKDIR /app
@@ -25,6 +26,9 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN addgroup --system app \
+    && adduser --system --ingroup app app
 
 COPY backend/requirements.txt ./requirements.txt
 RUN python -m pip install --upgrade pip \
@@ -35,7 +39,10 @@ COPY backend/.env.example ./.env.example
 COPY --from=frontend-build /build/frontend/dist ./static
 
 RUN mkdir -p /app/data \
-    && test -f /app/app/data/trading_calendar.json
+    && test -f /app/app/data/trading_calendar.json \
+    && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000
 

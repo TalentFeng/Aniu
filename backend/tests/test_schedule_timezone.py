@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 import sys
@@ -10,7 +11,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from app.core.config import get_settings
 from app.db import database as database_module
 from app.db.database import init_db, session_scope
-from app.db.models import StrategyRun, StrategySchedule
+from app.db.models import StrategyRun, StrategySchedule, TradeOrder
 from app.services.aniu_service import aniu_service
 
 
@@ -56,6 +57,45 @@ def test_compute_next_run_at_preserves_utc_timezone() -> None:
 
     assert result is not None
     assert result.tzinfo == timezone.utc
+
+
+def test_compute_next_run_at_respects_day_of_week_field() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    start = datetime(2026, 4, 13, 10, 0, tzinfo=shanghai)
+
+    result = aniu_service._compute_next_run_at("0 11 * * 2", from_time=start)
+
+    assert result is not None
+    in_shanghai = result.astimezone(shanghai)
+    assert in_shanghai.date().isoformat() == "2026-04-14"
+    assert in_shanghai.hour == 11
+    assert in_shanghai.minute == 0
+
+
+def test_compute_next_run_at_respects_day_and_month_fields() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    start = datetime(2026, 4, 13, 8, 0, tzinfo=shanghai)
+
+    result = aniu_service._compute_next_run_at("15 9 15 4 *", from_time=start)
+
+    assert result is not None
+    in_shanghai = result.astimezone(shanghai)
+    assert in_shanghai.date().isoformat() == "2026-04-15"
+    assert in_shanghai.hour == 9
+    assert in_shanghai.minute == 15
+
+
+def test_compute_next_run_at_supports_range_step_expression() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    start = datetime(2026, 4, 13, 9, 10, tzinfo=shanghai)
+
+    result = aniu_service._compute_next_run_at("10-14/2 9 * * 1-5", from_time=start)
+
+    assert result is not None
+    in_shanghai = result.astimezone(shanghai)
+    assert in_shanghai.date().isoformat() == "2026-04-13"
+    assert in_shanghai.hour == 9
+    assert in_shanghai.minute == 12
 
 
 def test_schedule_datetimes_are_stored_as_utc() -> None:
@@ -464,6 +504,183 @@ def test_process_due_schedule_runs_due_retry_when_window_arrives(monkeypatch, tm
     assert retry_id != normal_id
 
 
+def test_process_due_schedule_does_not_probe_locked_before_execute(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+    shanghai = ZoneInfo("Asia/Shanghai")
+
+    with session_scope() as db:
+        schedule = StrategySchedule(
+            name="收盘分析",
+            cron_expression="30 15 * * 1-5",
+            task_prompt="test",
+            timeout_seconds=1800,
+            enabled=True,
+            next_run_at=datetime(2026, 4, 13, 7, 30, tzinfo=timezone.utc),
+        )
+        db.add(schedule)
+        db.flush()
+        schedule_id = schedule.id
+
+    from app.services import aniu_service as aniu_service_module
+
+    original_now_shanghai = aniu_service_module.now_shanghai
+    original_is_trading_day = aniu_service_module.trading_calendar_service.is_trading_day
+    original_lock = aniu_service_module.aniu_service._run_lock
+    called: list[tuple[str, int | None]] = []
+
+    class LockProbe:
+        def locked(self) -> bool:
+            raise AssertionError("process_due_schedule should not call locked()")
+
+    monkeypatch.setattr(
+        aniu_service_module,
+        "now_shanghai",
+        lambda: datetime(2026, 4, 13, 15, 31, tzinfo=shanghai),
+    )
+    monkeypatch.setattr(
+        aniu_service_module.trading_calendar_service,
+        "is_trading_day",
+        lambda current: True,
+    )
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "execute_run",
+        lambda trigger_source="manual", schedule_id=None: called.append((trigger_source, schedule_id)),
+    )
+    aniu_service_module.aniu_service._run_lock = LockProbe()
+
+    try:
+        aniu_service.process_due_schedule()
+    finally:
+        aniu_service_module.now_shanghai = original_now_shanghai
+        aniu_service_module.trading_calendar_service.is_trading_day = original_is_trading_day
+        aniu_service_module.aniu_service._run_lock = original_lock
+        _reset_db_state()
+
+    assert called == [("schedule", schedule_id)]
+
+
+def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
+    monkeypatch, tmp_path
+) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent(settings, client):
+        del settings, client
+        return (
+            {
+                "final_answer": "执行两笔交易",
+                "tool_calls": [
+                    {
+                        "name": "mx_moni_trade",
+                        "result": {
+                            "ok": True,
+                            "executed_action": {
+                                "action": "BUY",
+                                "symbol": "300059",
+                                "quantity": 100,
+                                "price_type": "MARKET",
+                            },
+                            "result": {"order_id": "A-1"},
+                        },
+                    },
+                    {
+                        "name": "mx_moni_trade",
+                        "result": {
+                            "ok": True,
+                            "executed_action": {
+                                "action": "SELL",
+                                "symbol": "600519",
+                                "quantity": 50,
+                                "price_type": "LIMIT",
+                                "price": 123.45,
+                            },
+                            "result": {"order_id": "A-2"},
+                        },
+                    },
+                ],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    real_session_scope = aniu_service_module.session_scope
+    trade_order_add_count = {"value": 0}
+
+    @contextmanager
+    def flaky_session_scope():
+        with real_session_scope() as db:
+            original_add = db.add
+
+            def flaky_add(instance):
+                if isinstance(instance, TradeOrder):
+                    trade_order_add_count["value"] += 1
+                    if trade_order_add_count["value"] == 2:
+                        raise RuntimeError("persist order boom")
+                return original_add(instance)
+
+            db.add = flaky_add  # type: ignore[method-assign]
+            yield db
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_prefetch_account_tool_calls",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_build_prefetched_account_context",
+        lambda tool_calls: None,
+    )
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请执行测试交易。",
+            },
+        )(),
+    )
+    monkeypatch.setattr(aniu_service_module, "session_scope", flaky_session_scope)
+
+    try:
+        with pytest.raises(RuntimeError, match="persist order boom"):
+            aniu_service.execute_run(trigger_source="manual")
+
+        with session_scope() as db:
+            runs = db.query(StrategyRun).all()
+            orders = db.query(TradeOrder).all()
+    finally:
+        _reset_db_state()
+
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert orders == []
+
+
 def test_trading_calendar_service_can_fill_missing_year(monkeypatch, tmp_path) -> None:
     from app.services.trading_calendar_service import TradingCalendarService
 
@@ -650,7 +867,10 @@ def test_account_overview_prefers_live_positions_over_cached_snapshot(monkeypatc
     )
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
 
-    overview = aniu_service_module.aniu_service.get_account_overview(force_refresh=True)
+    overview = aniu_service_module.aniu_service.get_account_overview(
+        include_raw=True,
+        force_refresh=True,
+    )
 
     assert overview["positions"]
     assert overview["positions"][0]["name"] == "扬杰科技"
@@ -726,7 +946,10 @@ def test_account_overview_falls_back_to_cached_orders_when_live_orders_fail(
     )
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
 
-    overview = aniu_service_module.aniu_service.get_account_overview(force_refresh=True)
+    overview = aniu_service_module.aniu_service.get_account_overview(
+        include_raw=True,
+        force_refresh=True,
+    )
 
     assert overview["orders"]
     assert overview["orders"][0]["order_id"] == "cached-order-1"
@@ -827,54 +1050,43 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
         def __init__(self, *args, **kwargs) -> None:
             pass
 
+        def get_balance(self) -> dict[str, object]:
+            prefetched_names.append("mx_get_balance")
+            return {"data": {"totalAsset": 100000, "balanceActual": 95000}}
+
+        def get_positions(self) -> dict[str, object]:
+            prefetched_names.append("mx_get_positions")
+            return {
+                "data": {
+                    "rows": [
+                        {
+                            "stockCode": "300373",
+                            "stockName": "扬杰科技",
+                            "marketValue": 5000,
+                            "count": 100,
+                        }
+                    ]
+                }
+            }
+
+        def get_orders(self) -> dict[str, object]:
+            prefetched_names.append("mx_get_orders")
+            return {
+                "data": {
+                    "rows": [
+                        {
+                            "orderId": "1",
+                            "stockCode": "300373",
+                            "stockName": "扬杰科技",
+                            "orderStatus": 2,
+                            "orderDrt": 1,
+                        }
+                    ]
+                }
+            }
+
         def close(self) -> None:
             pass
-
-    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
-        del client, app_settings, arguments
-        prefetched_names.append(tool_name)
-        if tool_name == "mx_get_balance":
-            return {
-                "ok": True,
-                "tool_name": tool_name,
-                "result": {"data": {"totalAsset": 100000, "balanceActual": 95000}},
-            }
-        if tool_name == "mx_get_positions":
-            return {
-                "ok": True,
-                "tool_name": tool_name,
-                "result": {
-                    "data": {
-                        "rows": [
-                            {
-                                "stockCode": "300373",
-                                "stockName": "扬杰科技",
-                                "marketValue": 5000,
-                                "count": 100,
-                            }
-                        ]
-                    }
-                },
-            }
-        if tool_name == "mx_get_orders":
-            return {
-                "ok": True,
-                "tool_name": tool_name,
-                "result": {
-                    "data": {
-                        "rows": [
-                            {
-                                "orderId": "1",
-                                "stockCode": "300373",
-                                "stockName": "扬杰科技",
-                                "orderStatus": 2,
-                                "orderDrt": 1,
-                            }
-                        ]
-                    }
-                },
-            }
-        raise AssertionError(f"unexpected tool {tool_name}")
 
     def fake_run_agent(settings, client):
         del client
@@ -890,11 +1102,6 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
         )
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
-    monkeypatch.setattr(
-        aniu_service_module.mx_skill_service,
-        "execute_tool",
-        fake_execute_tool,
-    )
     monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
 
     run = aniu_service.execute_run(trigger_source="manual")
@@ -906,6 +1113,76 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
     assert run.skill_payloads is not None
     assert run.skill_payloads.get("prefetched_tool_calls")
     assert run.skill_payloads.get("prefetched_context")
+
+
+def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请分析当前账户。",
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent(settings, client, emit=None):
+        del client
+        captured["task_prompt"] = settings.task_prompt
+        captured["emit_is_callable"] = callable(emit)
+        return (
+            {
+                "final_answer": "保持观察。",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_prefetch_account_tool_calls",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "_build_prefetched_account_context",
+        lambda tool_calls: None,
+    )
+    monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
+
+    run = aniu_service.execute_run(trigger_source="manual")
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert captured["task_prompt"] == "请分析当前账户。"
+    assert captured["emit_is_callable"] is True
 
 
 def test_daily_profit_trade_date_falls_back_to_previous_trading_day_on_weekend(

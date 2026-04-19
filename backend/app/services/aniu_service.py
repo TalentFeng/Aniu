@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import queue
+import secrets
+import time
+import traceback
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-from typing import Any
+from threading import Event, Lock, Thread
+from types import SimpleNamespace
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -17,7 +23,8 @@ from app.core.constants import DEFAULT_SYSTEM_PROMPT
 from app.db.database import session_scope
 from app.db.models import AppSettings, StrategyRun, StrategySchedule, TradeOrder
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
-from app.services.llm_service import llm_service
+from app.services.event_bus import event_bus, make_emitter
+from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
 from app.services.trading_calendar_service import trading_calendar_service
@@ -172,6 +179,19 @@ class AniuService:
             return "trade"
         return "analysis"
 
+    def _run_agent_supports_emit(self, run_agent: Any) -> bool:
+        try:
+            signature = inspect.signature(run_agent)
+        except (TypeError, ValueError):
+            return True
+
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+            if parameter.name == "emit":
+                return True
+        return False
+
     def _infer_run_type(self, run: StrategyRun) -> str:
         schedule_name = str(run.schedule_name or "").strip()
         if schedule_name in ANALYSIS_TASK_NAMES:
@@ -205,7 +225,7 @@ class AniuService:
         if not expected_password:
             raise RuntimeError("未配置登录密码，请先设置 APP_LOGIN_PASSWORD。")
 
-        if password != expected_password:
+        if not secrets.compare_digest(password, expected_password):
             raise RuntimeError("密码错误。")
 
         token = create_access_token("single-user")
@@ -371,7 +391,7 @@ class AniuService:
         )
         runs = list(db.scalars(stmt).all())
         for run in runs:
-            self._hydrate_run_datetimes(run)
+            self._hydrate_run_datetimes(run, include_display_fields=False)
         return runs
 
     def list_runs_page(
@@ -423,17 +443,20 @@ class AniuService:
         )
         run = db.scalar(stmt)
         if run is not None:
-            self._hydrate_run_datetimes(run)
+            self._hydrate_run_datetimes(run, include_display_fields=True)
         return run
 
-    def _hydrate_run_datetimes(self, run: StrategyRun) -> None:
+    def _hydrate_run_datetimes(
+        self, run: StrategyRun, *, include_display_fields: bool
+    ) -> None:
         run.started_at = _assume_utc(run.started_at)
         run.finished_at = _assume_utc(run.finished_at)
         run.run_type = self._infer_run_type(run)
         self._hydrate_run_summary_metrics(run)
-        self._hydrate_run_display_fields(run)
-        for order in run.trade_orders:
-            order.created_at = _assume_utc(order.created_at)
+        if include_display_fields:
+            self._hydrate_run_display_fields(run)
+            for order in run.trade_orders:
+                order.created_at = _assume_utc(order.created_at)
 
     def _hydrate_run_summary_metrics(self, run: StrategyRun) -> None:
         token_usage = self._get_run_token_usage(run)
@@ -560,20 +583,32 @@ class AniuService:
         }
         return mapping.get(name, {"name": name or "未命名调用", "summary": "执行一次系统或妙想工具调用。"})
 
-    def _build_run_api_details(self, run: StrategyRun) -> list[dict[str, str]]:
+    def _build_run_api_details(self, run: StrategyRun) -> list[dict[str, Any]]:
         trade_tool_names = {"mx_moni_trade", "mx_moni_cancel"}
-        results: list[dict[str, str]] = []
+        results: list[dict[str, Any]] = []
         for idx, item in enumerate(self._get_detail_tool_calls(run)):
             tool_name = str(item.get("name") or "")
             if tool_name in trade_tool_names:
                 continue
             tool_text = self._get_api_tool_text(tool_name)
+            result = item.get("result")
+            ok: bool | None = None
+            status = "done"
+            if isinstance(result, dict) and "ok" in result:
+                ok = bool(result.get("ok"))
+                status = "done" if ok else "failed"
             results.append(
                 {
                     "tool_name": tool_name,
                     "name": tool_text["name"],
                     "summary": tool_text["summary"],
                     "preview_index": idx,
+                    "tool_call_id": str(
+                        item.get("id") or item.get("tool_call_id") or ""
+                    )
+                    or None,
+                    "status": status,
+                    "ok": ok,
                 }
             )
         return results
@@ -640,6 +675,12 @@ class AniuService:
         display_symbol = symbol or "--"
         return f"挂单{action_text}{display_symbol}共计{volume}股。"
 
+    def _resolve_trade_detail_status(self, raw_status: Any) -> tuple[str, bool | None]:
+        text = str(raw_status or "").strip().lower()
+        if text and any(flag in text for flag in ("fail", "error", "reject")):
+            return "failed", False
+        return "done", True
+
     def _build_run_trade_details(self, run: StrategyRun) -> list[dict[str, Any]]:
         tool_calls = self._get_detail_tool_calls(run)
         if run.trade_orders:
@@ -648,6 +689,7 @@ class AniuService:
                 action_name = str(order.action).upper()
                 trade_action = "sell" if action_name == "SELL" else "buy"
                 tool_name = self._match_trade_tool_name(tool_calls, order.symbol, action_name)
+                detail_status, detail_ok = self._resolve_trade_detail_status(order.status)
                 details.append(
                     {
                         "action": trade_action,
@@ -662,6 +704,8 @@ class AniuService:
                         "summary": self._get_trade_summary(trade_action, order.symbol, int(order.quantity)),
                         "tool_name": tool_name,
                         "preview_index": self._find_tool_call_index(tool_calls, tool_name, order.symbol),
+                        "status": detail_status,
+                        "ok": detail_ok,
                     }
                 )
             return details
@@ -679,6 +723,9 @@ class AniuService:
             volume = int(action.get("quantity") or 0)
             symbol = str(action.get("symbol") or "--")
             tool_name = self._match_trade_tool_name(tool_calls, symbol, action_name)
+            detail_status, detail_ok = self._resolve_trade_detail_status(
+                action.get("status")
+            )
             details.append(
                 {
                     "action": trade_action,
@@ -691,6 +738,8 @@ class AniuService:
                     "summary": self._get_trade_summary(trade_action, symbol, volume),
                     "tool_name": tool_name,
                     "preview_index": self._find_tool_call_index(tool_calls, tool_name, symbol),
+                    "status": detail_status,
+                    "ok": detail_ok,
                 }
             )
         return details
@@ -913,11 +962,7 @@ class AniuService:
             orders_result=orders_result,
         )
 
-    def _get_cached_account_overview(
-        self,
-        *,
-        include_raw: bool,
-    ) -> dict[str, Any] | None:
+    def _get_cached_account_overview(self) -> dict[str, Any] | None:
         with self._account_cache_lock:
             if (
                 self._account_overview_cache is None
@@ -928,13 +973,7 @@ class AniuService:
                 self._account_overview_cache_expires_at = None
                 return None
 
-            cached = dict(self._account_overview_cache)
-
-        if not include_raw:
-            cached.pop("raw_balance", None)
-            cached.pop("raw_positions", None)
-            cached.pop("raw_orders", None)
-        return cached
+            return dict(self._account_overview_cache)
 
     def _set_cached_account_overview(self, overview: dict[str, Any]) -> None:
         ttl_seconds = max(0, int(get_settings().account_overview_cache_ttl_seconds))
@@ -944,8 +983,15 @@ class AniuService:
                 self._account_overview_cache_expires_at = None
             return
 
+        # Keep debug-only upstream payloads out of the process cache to reduce
+        # steady-state RSS while preserving the normalized account summary.
+        cached_overview = dict(overview)
+        cached_overview.pop("raw_balance", None)
+        cached_overview.pop("raw_positions", None)
+        cached_overview.pop("raw_orders", None)
+
         with self._account_cache_lock:
-            self._account_overview_cache = dict(overview)
+            self._account_overview_cache = cached_overview
             self._account_overview_cache_expires_at = now_utc() + timedelta(
                 seconds=ttl_seconds
             )
@@ -964,11 +1010,11 @@ class AniuService:
     def get_account_overview(
         self,
         *,
-        include_raw: bool = True,
+        include_raw: bool = False,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        if not force_refresh:
-            cached_overview = self._get_cached_account_overview(include_raw=include_raw)
+        if not force_refresh and not include_raw:
+            cached_overview = self._get_cached_account_overview()
             if cached_overview is not None:
                 return cached_overview
 
@@ -1097,49 +1143,22 @@ class AniuService:
     def chat(self, payload: ChatRequest) -> dict[str, Any]:
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
-            latest_run = self.list_runs(db, limit=1)
 
         if not settings.llm_base_url or not settings.llm_api_key:
             raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 
-        context_sections: list[str] = []
-        if payload.include_account_summary or payload.include_positions_orders:
-            overview = self.get_account_overview()
-            if payload.include_account_summary:
-                context_sections.append(self._build_chat_account_summary(overview))
-            if payload.include_positions_orders:
-                context_sections.append(
-                    self._build_chat_positions_orders_summary(overview)
-                )
-
-        if payload.include_latest_run_summary:
-            context_sections.append(
-                self._build_chat_latest_run_summary(
-                    latest_run[0] if latest_run else None
-                )
-            )
-
         messages = [
             {"role": item.role, "content": item.content} for item in payload.messages
         ]
-        if context_sections and messages:
-            messages[-1]["content"] = "\n\n".join(
-                [
-                    messages[-1]["content"],
-                    "以下是可选上下文，请结合使用：",
-                    *[section for section in context_sections if section],
-                ]
-            )
 
         content = llm_service.chat(
             model=settings.llm_model,
             base_url=str(settings.llm_base_url),
             api_key=str(settings.llm_api_key),
-            system_prompt=settings.system_prompt
-            if payload.include_system_prompt
-            else None,
+            system_prompt=settings.system_prompt,
             messages=messages,
             timeout_seconds=1800,
+            tool_context={"app_settings": settings},
         )
 
         return {
@@ -1148,47 +1167,95 @@ class AniuService:
                 "content": content,
             },
             "context": {
-                "include_system_prompt": payload.include_system_prompt,
-                "include_account_summary": payload.include_account_summary,
-                "include_positions_orders": payload.include_positions_orders,
-                "include_latest_run_summary": payload.include_latest_run_summary,
+                "system_prompt_included": True,
+                "tool_access_account_summary": True,
+                "tool_access_positions": True,
+                "tool_access_orders": True,
+                "tool_access_runs": True,
             },
         }
 
-    def _build_chat_account_summary(self, overview: dict[str, Any]) -> str:
-        return (
-            "账户摘要："
-            f"总资产={overview.get('total_assets') or '--'}，"
-            f"现金余额={overview.get('cash_balance') or '--'}，"
-            f"持仓市值={overview.get('total_market_value') or '--'}，"
-            f"当日盈亏={overview.get('daily_profit') or '--'}。"
+    def chat_stream(self, payload: ChatRequest) -> Iterator[dict[str, Any]]:
+        """Yield SSE-style events from the chat agent loop in real time.
+
+        Runs the LLM agent loop on a worker thread and forwards emitted events
+        to subscribers via an in-process queue. No StrategyRun is created."""
+        with session_scope() as db:
+            settings = self.get_or_create_settings(db)
+
+        if not settings.llm_base_url or not settings.llm_api_key:
+            raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
+
+        messages = [
+            {"role": item.role, "content": item.content} for item in payload.messages
+        ]
+        settings_snapshot = SimpleNamespace(
+            mx_api_key=settings.mx_api_key,
+            system_prompt=settings.system_prompt,
+            llm_model=settings.llm_model,
+            llm_base_url=str(settings.llm_base_url),
+            llm_api_key=str(settings.llm_api_key),
         )
 
-    def _build_chat_positions_orders_summary(self, overview: dict[str, Any]) -> str:
-        positions = overview.get("positions") or []
-        orders = overview.get("orders") or []
-        position_lines = [
-            f"{item.get('name') or item.get('symbol')}: 持仓{item.get('volume') or '--'}股, 盈亏{item.get('profit_text') or '--'}"
-            for item in positions[:5]
-        ]
-        order_lines = [
-            f"{item.get('name') or item.get('symbol')}: {item.get('side_text') or '--'} {item.get('status_text') or '--'}"
-            for item in orders[:5]
-        ]
-        return (
-            "持仓与委托摘要：\n持仓："
-            + ("；".join(position_lines) if position_lines else "暂无")
-            + "\n委托："
-            + ("；".join(order_lines) if order_lines else "暂无")
-        )
+        event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        cancel_event = Event()
 
-    def _build_chat_latest_run_summary(self, run: StrategyRun | None) -> str:
-        if run is None:
-            return "最近运行摘要：暂无运行记录。"
-        summary = str(
-            run.analysis_summary or run.final_answer or run.error_message or "--"
-        ).strip()
-        return f"最近运行摘要：状态={run.status}；开始时间={run.started_at}；摘要={summary}"
+        def _emit(event_type: str, **data: Any) -> None:
+            event_queue.put(
+                {"type": event_type, "ts": time.time(), **data}
+            )
+
+        def _worker() -> None:
+            try:
+                content = llm_service.chat(
+                    model=settings_snapshot.llm_model,
+                    base_url=settings_snapshot.llm_base_url,
+                    api_key=settings_snapshot.llm_api_key,
+                    system_prompt=settings_snapshot.system_prompt,
+                    messages=messages,
+                    timeout_seconds=180,
+                    tool_context={"app_settings": settings_snapshot},
+                    emit=_emit,
+                    cancel_event=cancel_event,
+                )
+                _emit("completed", message=content)
+            except LLMStreamCancelled:
+                logger.info("chat_stream worker cancelled")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("chat_stream worker failed")
+                _emit(
+                    "failed",
+                    message=str(exc),
+                    traceback=traceback.format_exc(limit=4),
+                )
+            finally:
+                event_queue.put(None)
+
+        worker = Thread(target=_worker, daemon=True, name="aniu-chat-stream")
+        worker.start()
+
+        terminal_event_seen = False
+        try:
+            while True:
+                try:
+                    event = event_queue.get(timeout=15.0)
+                except queue.Empty:
+                    yield {"type": "heartbeat", "ts": time.time()}
+                    continue
+                if event is None:
+                    return
+                if event.get("type") in {"completed", "failed"}:
+                    terminal_event_seen = True
+                yield event
+                if terminal_event_seen:
+                    # Drain any trailing events until sentinel so the thread exits cleanly.
+                    while True:
+                        trailing = event_queue.get()
+                        if trailing is None:
+                            return
+        finally:
+            cancel_event.set()
+            worker.join(timeout=1.0)
 
     def _build_orders_overview(
         self, orders_payload: dict[str, Any] | None
@@ -1425,68 +1492,96 @@ class AniuService:
         )
         return summaries
 
-    def execute_run(
+    def _prepare_run(
         self,
-        trigger_source: str = "manual",
-        schedule_id: int | None = None,
-    ) -> StrategyRun:
-        if not self._run_lock.acquire(blocking=False):
-            raise RuntimeError("已有运行中的任务，请稍后再试。")
+        trigger_source: str,
+        schedule_id: int | None,
+    ) -> tuple[int, dict[str, Any]]:
+        with session_scope() as db:
+            settings = self.get_or_create_settings(db)
+            schedule = (
+                db.get(StrategySchedule, schedule_id) if schedule_id else None
+            )
+            if schedule_id is not None and schedule is None:
+                raise RuntimeError("指定的定时任务不存在。")
+            run = StrategyRun(
+                trigger_source=trigger_source,
+                run_type=schedule.run_type if schedule else "analysis",
+                schedule_name=schedule.name if schedule else None,
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+            manual_task_prompt = str(
+                getattr(settings, "task_prompt", "") or ""
+            ).strip() or (
+                "请先分析当前情况，必要时自行调用妙想工具获取数据，并在需要时执行模拟交易。"
+                "最后用自然语言总结本次判断、依据和操作结果。"
+            )
+            settings_snapshot = {
+                "id": settings.id,
+                "mx_api_key": settings.mx_api_key,
+                "llm_base_url": settings.llm_base_url,
+                "llm_api_key": settings.llm_api_key,
+                "llm_model": settings.llm_model,
+                "run_type": schedule.run_type if schedule else "analysis",
+                "system_prompt": settings.system_prompt,
+                "task_prompt": schedule.task_prompt if schedule else manual_task_prompt,
+                "timeout_seconds": int(
+                    schedule.timeout_seconds if schedule else 1800
+                ),
+            }
+        return run_id, settings_snapshot
 
-        run_id: int | None = None
+    def _run_body(
+        self,
+        *,
+        run_id: int,
+        settings_snapshot: dict[str, Any],
+        trigger_source: str,
+        schedule_id: int | None,
+        emit: Any = None,
+        return_full_run: bool = True,
+    ) -> StrategyRun | None:
         prefetched_tool_calls: list[dict[str, Any]] = []
         prefetched_context: str | None = None
-        try:
-            with session_scope() as db:
-                settings = self.get_or_create_settings(db)
-                schedule = (
-                    db.get(StrategySchedule, schedule_id) if schedule_id else None
-                )
-                if schedule_id is not None and schedule is None:
-                    raise RuntimeError("指定的定时任务不存在。")
-                run = StrategyRun(
-                    trigger_source=trigger_source,
-                    run_type=schedule.run_type if schedule else "analysis",
-                    schedule_name=schedule.name if schedule else None,
-                    status="running",
-                )
-                db.add(run)
-                db.flush()
-                run_id = run.id
-                settings_snapshot = {
-                    "id": settings.id,
-                    "mx_api_key": settings.mx_api_key,
-                    "llm_base_url": settings.llm_base_url,
-                    "llm_api_key": settings.llm_api_key,
-                    "llm_model": settings.llm_model,
-                    "run_type": schedule.run_type if schedule else "analysis",
-                    "system_prompt": settings.system_prompt,
-                    "task_prompt": (
-                        schedule.task_prompt
-                        if schedule
-                        else "请先分析当前情况，必要时自行调用妙想工具获取数据，并在需要时执行模拟交易。最后用自然语言总结本次判断、依据和操作结果。"
-                    ),
-                    "timeout_seconds": int(
-                        schedule.timeout_seconds if schedule else 1800
-                    ),
-                }
+        _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
 
+        try:
             logger.info(
                 "execute_run started: run_id=%s, trigger=%s, schedule_id=%s",
                 run_id,
                 trigger_source,
                 schedule_id,
             )
+            _emit(
+                "stage",
+                stage="started",
+                message="任务已启动",
+                trigger_source=trigger_source,
+                schedule_id=schedule_id,
+            )
 
-            settings = type("SettingsSnapshot", (), settings_snapshot)()
+            settings = SimpleNamespace(**settings_snapshot)
             if not settings.mx_api_key:
                 raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
             client = MXClient(api_key=settings.mx_api_key)
             try:
+                _emit("stage", stage="prefetch", message="正在预取账户数据")
                 prefetched_tool_calls = self._prefetch_account_tool_calls(
                     client=client,
                     app_settings=settings,
                 )
+                for call in prefetched_tool_calls:
+                    _emit(
+                        "tool_call",
+                        phase="prefetch",
+                        tool_name=call.get("tool_name") or call.get("name"),
+                        status="done",
+                        ok=bool(call.get("ok", True)),
+                        summary=call.get("summary"),
+                    )
                 prefetched_context = self._build_prefetched_account_context(
                     prefetched_tool_calls
                 )
@@ -1499,12 +1594,19 @@ class AniuService:
                         if original_task_prompt
                         else prefetched_context
                     )
-                decision, llm_request, llm_response, runtime_trace = (
-                    llm_service.run_agent(
+                _emit("stage", stage="llm", message="正在调用大模型")
+                run_agent = llm_service.run_agent
+                if self._run_agent_supports_emit(run_agent):
+                    decision, llm_request, llm_response, runtime_trace = run_agent(
+                        settings,
+                        client,
+                        emit=_emit,
+                    )
+                else:
+                    decision, llm_request, llm_response, runtime_trace = run_agent(
                         settings,
                         client,
                     )
-                )
             finally:
                 client.close()
 
@@ -1516,6 +1618,26 @@ class AniuService:
                 "runtime_trace": runtime_trace,
             }
             executed_actions = self._extract_executed_actions(tool_calls)
+            persisted_trade_orders = [
+                {
+                    "symbol": action.get("symbol"),
+                    "action": action.get("action"),
+                    "quantity": action.get("quantity"),
+                    "price": action.get("price"),
+                    "status": action.get("status") or "submitted",
+                }
+                for action in executed_actions
+                if str(action.get("action") or "") in {"BUY", "SELL"}
+            ]
+            completed_at = now_utc()
+            completed_at_shanghai = completed_at.astimezone(SHANGHAI_TZ)
+
+            if persisted_trade_orders:
+                _emit(
+                    "stage",
+                    stage="trade",
+                    message=f"正在写入交易执行记录（{len(persisted_trade_orders)} 条）",
+                )
 
             with session_scope() as db:
                 run = db.get(StrategyRun, run_id)
@@ -1531,44 +1653,61 @@ class AniuService:
                 run.final_answer = (
                     str(decision.get("final_answer") or "").strip() or None
                 )
-                db.add(run)
-
-            for action in executed_actions:
-                if str(action.get("action") or "") not in {"BUY", "SELL"}:
-                    continue
-                with session_scope() as db:
-                    order = TradeOrder(
-                        run_id=run_id,
-                        symbol=str(action.get("symbol") or ""),
-                        action=str(action.get("action") or ""),
-                        quantity=int(action.get("quantity") or 0),
-                        price_type=str(action.get("price_type") or "MARKET"),
-                        price=_parse_float(action.get("price")),
-                        status=str(action.get("status") or "submitted"),
-                        response_payload=action.get("response"),
-                    )
-                    db.add(order)
-
-            with session_scope() as db:
-                run = db.get(StrategyRun, run_id)
-                if run is None:
-                    raise RuntimeError("运行记录不存在。")
                 run.executed_actions = executed_actions
                 run.status = "completed"
-                run.finished_at = now_utc()
+                run.finished_at = completed_at
                 db.add(run)
+
+                for action in executed_actions:
+                    if str(action.get("action") or "") not in {"BUY", "SELL"}:
+                        continue
+                    db.add(
+                        TradeOrder(
+                            run_id=run_id,
+                            symbol=str(action.get("symbol") or ""),
+                            action=str(action.get("action") or ""),
+                            quantity=int(action.get("quantity") or 0),
+                            price_type=str(action.get("price_type") or "MARKET"),
+                            price=_parse_float(action.get("price")),
+                            status=str(action.get("status") or "submitted"),
+                            response_payload=action.get("response"),
+                        )
+                    )
 
                 if schedule_id:
                     schedule = db.get(StrategySchedule, schedule_id)
                     if schedule is not None:
-                        schedule.last_run_at = now_utc()
+                        schedule.last_run_at = completed_at
                         schedule.retry_count = 0
                         schedule.retry_after_at = None
                         schedule.next_run_at = self._compute_next_run_at(
                             schedule.cron_expression,
-                            from_time=now_shanghai(),
+                            from_time=completed_at_shanghai,
                         )
                         db.add(schedule)
+
+            for action in persisted_trade_orders:
+                _emit(
+                    "trade_order",
+                    symbol=action.get("symbol"),
+                    action=action.get("action"),
+                    quantity=action.get("quantity"),
+                    price=action.get("price"),
+                    status=action.get("status") or "submitted",
+                )
+
+            if not return_full_run:
+                logger.info(
+                    "execute_run completed: run_id=%s, actions=%d",
+                    run_id,
+                    len(executed_actions),
+                )
+                _emit(
+                    "completed",
+                    message="任务完成",
+                    actions=len(executed_actions),
+                )
+                return None
 
             with session_scope() as db:
                 run = self.get_run(db, run_id)
@@ -1579,6 +1718,11 @@ class AniuService:
                     run_id,
                     len(executed_actions),
                 )
+                _emit(
+                    "completed",
+                    message="任务完成",
+                    actions=len(executed_actions),
+                )
                 return run
         except Exception as exc:
             logger.error(
@@ -1586,55 +1730,111 @@ class AniuService:
                 run_id,
                 exc,
             )
-            if run_id is not None:
-                with session_scope() as db:
-                    run = db.get(StrategyRun, run_id)
-                    if run is not None:
-                        if prefetched_tool_calls:
-                            existing_skill_payloads = (
-                                run.skill_payloads
-                                if isinstance(run.skill_payloads, dict)
-                                else {}
-                            )
-                            existing_skill_payloads["prefetched_tool_calls"] = (
-                                prefetched_tool_calls
-                            )
-                            existing_skill_payloads["prefetched_context"] = (
-                                prefetched_context
-                            )
-                            run.skill_payloads = existing_skill_payloads
-                        run.status = "failed"
-                        run.error_message = str(exc)
-                        run.final_answer = None
-                        run.finished_at = now_utc()
-                        db.add(run)
-                    if schedule_id:
-                        schedule = db.get(StrategySchedule, schedule_id)
-                        if schedule is not None:
-                            schedule.last_run_at = now_utc()
-                            schedule.next_run_at = self._compute_next_run_at(
-                                schedule.cron_expression,
-                                from_time=now_shanghai(),
-                            )
-                            if trigger_source == "schedule":
-                                retry_count = max(int(schedule.retry_count or 0), 0)
-                                if retry_count < SCHEDULE_MAX_RETRIES:
-                                    schedule.retry_count = retry_count + 1
-                                    schedule.retry_after_at = now_utc() + SCHEDULE_RETRY_DELAY
-                                else:
-                                    schedule.retry_count = 0
-                                    schedule.retry_after_at = None
+            with session_scope() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is not None:
+                    if prefetched_tool_calls:
+                        existing_skill_payloads = (
+                            run.skill_payloads
+                            if isinstance(run.skill_payloads, dict)
+                            else {}
+                        )
+                        existing_skill_payloads["prefetched_tool_calls"] = (
+                            prefetched_tool_calls
+                        )
+                        existing_skill_payloads["prefetched_context"] = (
+                            prefetched_context
+                        )
+                        run.skill_payloads = existing_skill_payloads
+                    run.status = "failed"
+                    run.error_message = str(exc)
+                    run.final_answer = None
+                    run.finished_at = now_utc()
+                    db.add(run)
+                if schedule_id:
+                    schedule = db.get(StrategySchedule, schedule_id)
+                    if schedule is not None:
+                        schedule.last_run_at = now_utc()
+                        schedule.next_run_at = self._compute_next_run_at(
+                            schedule.cron_expression,
+                            from_time=now_shanghai(),
+                        )
+                        if trigger_source == "schedule":
+                            retry_count = max(int(schedule.retry_count or 0), 0)
+                            if retry_count < SCHEDULE_MAX_RETRIES:
+                                schedule.retry_count = retry_count + 1
+                                schedule.retry_after_at = now_utc() + SCHEDULE_RETRY_DELAY
                             else:
-                                schedule.retry_count = max(int(schedule.retry_count or 0), 0)
-                            db.add(schedule)
+                                schedule.retry_count = 0
+                                schedule.retry_after_at = None
+                        else:
+                            schedule.retry_count = max(int(schedule.retry_count or 0), 0)
+                        db.add(schedule)
+            _emit("failed", message=str(exc))
             raise
+
+    def execute_run(
+        self,
+        trigger_source: str = "manual",
+        schedule_id: int | None = None,
+    ) -> StrategyRun:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("已有运行中的任务，请稍后再试。")
+        try:
+            run_id, settings_snapshot = self._prepare_run(trigger_source, schedule_id)
+            return self._run_body(
+                run_id=run_id,
+                settings_snapshot=settings_snapshot,
+                trigger_source=trigger_source,
+                schedule_id=schedule_id,
+            )
         finally:
             self._run_lock.release()
 
-    def process_due_schedule(self) -> None:
-        if self._run_lock.locked():
-            return
+    def start_run_async(
+        self,
+        trigger_source: str = "manual",
+        schedule_id: int | None = None,
+    ) -> int:
+        """Launch a run on a background thread and return its run_id immediately.
 
+        Event stream: subscribe via ``event_bus`` using the returned run_id.
+        """
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("已有运行中的任务，请稍后再试。")
+
+        run_id: int | None = None
+        try:
+            run_id, settings_snapshot = self._prepare_run(trigger_source, schedule_id)
+        except Exception:
+            self._run_lock.release()
+            raise
+
+        emit = make_emitter(run_id)
+
+        def _worker() -> None:
+            try:
+                self._run_body(
+                    run_id=run_id,
+                    settings_snapshot=settings_snapshot,
+                    trigger_source=trigger_source,
+                    schedule_id=schedule_id,
+                    emit=emit,
+                    return_full_run=False,
+                )
+            except Exception:
+                logger.exception("async run worker failed: run_id=%s", run_id)
+            finally:
+                self._run_lock.release()
+
+        Thread(
+            target=_worker,
+            name=f"run-{run_id}",
+            daemon=True,
+        ).start()
+        return run_id
+
+    def process_due_schedule(self) -> None:
         due_schedule_id: int | None = None
         with session_scope() as db:
             schedules = self.list_schedules(db)
@@ -1674,7 +1874,16 @@ class AniuService:
                         due_schedule_id = schedule.id
 
         if due_schedule_id is not None:
-            self.execute_run(trigger_source="schedule", schedule_id=due_schedule_id)
+            try:
+                self.execute_run(trigger_source="schedule", schedule_id=due_schedule_id)
+            except RuntimeError as exc:
+                if "已有运行中的任务" in str(exc):
+                    logger.info(
+                        "process_due_schedule skipped because another run is active: schedule_id=%s",
+                        due_schedule_id,
+                    )
+                    return
+                raise
 
     def _safe_call(self, func: Any) -> dict[str, Any]:
         try:
@@ -1746,21 +1955,38 @@ class AniuService:
         client: MXClient,
         app_settings: Any,
     ) -> list[dict[str, Any]]:
-        prefetched_tool_calls: list[dict[str, Any]] = []
+        del app_settings
+        live_payloads = self._fetch_live_account_payloads(client)
+        payload_map = {
+            "mx_get_balance": ("balance", "已查询账户资金。"),
+            "mx_get_positions": ("positions", "已查询持仓。"),
+            "mx_get_orders": ("orders", "已查询委托记录。"),
+        }
+
+        tool_calls: list[dict[str, Any]] = []
         for tool_name in ACCOUNT_PREFETCH_TOOL_NAMES:
-            prefetched_tool_calls.append(
+            payload_key, summary = payload_map[tool_name]
+            raw_result = live_payloads[payload_key]
+            result: dict[str, Any] = {
+                "ok": bool(raw_result.get("ok")),
+                "tool_name": tool_name,
+            }
+            if raw_result.get("ok"):
+                result["summary"] = summary
+                result["result"] = raw_result.get("result")
+            else:
+                result["error"] = str(raw_result.get("error") or "预取失败")
+
+            tool_calls.append(
                 {
                     "name": tool_name,
                     "arguments": {},
-                    "result": mx_skill_service.execute_tool(
-                        client=client,
-                        app_settings=app_settings,
-                        tool_name=tool_name,
-                        arguments={},
-                    ),
+                    "ok": result["ok"],
+                    "summary": result.get("summary"),
+                    "result": result,
                 }
             )
-        return prefetched_tool_calls
+        return tool_calls
 
     def _build_prefetched_account_context(
         self, tool_calls: list[dict[str, Any]]
@@ -1908,7 +2134,21 @@ class AniuService:
         if len(parts) != 5:
             return None
 
-        minute_expr, hour_expr, _, _, _ = parts
+        minute_expr, hour_expr, day_of_month_expr, month_expr, day_of_week_expr = parts
+        try:
+            minute_values = self._parse_cron_values(minute_expr, 0, 59)
+            hour_values = self._parse_cron_values(hour_expr, 0, 23)
+            day_of_month_values = self._parse_cron_values(day_of_month_expr, 1, 31)
+            month_values = self._parse_cron_values(month_expr, 1, 12)
+            day_of_week_values = self._parse_cron_values(
+                day_of_week_expr,
+                0,
+                6,
+                allow_seven_as_zero=True,
+            )
+        except ValueError:
+            return None
+
         current_base = from_time or now_shanghai()
         if current_base.tzinfo is None:
             current_base = current_base.replace(tzinfo=SHANGHAI_TZ)
@@ -1917,7 +2157,7 @@ class AniuService:
 
         current = current_base.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
-        for _ in range(60 * 24 * 31):
+        for _ in range(60 * 24 * 366 * 2):
             if not trading_calendar_service.is_trading_day(current.date()):
                 next_day = trading_calendar_service.next_trading_day(current.date())
                 current = datetime.combine(
@@ -1925,42 +2165,115 @@ class AniuService:
                 )
                 continue
 
-            if self._matches_cron_value(
-                current.minute, minute_expr, 0, 59
-            ) and self._matches_cron_value(current.hour, hour_expr, 0, 23):
+            if (
+                current.minute in minute_values
+                and current.hour in hour_values
+                and current.month in month_values
+                and self._matches_cron_day(
+                    current,
+                    day_of_month_values=day_of_month_values,
+                    day_of_week_values=day_of_week_values,
+                    day_of_month_expr=day_of_month_expr,
+                    day_of_week_expr=day_of_week_expr,
+                )
+            ):
                 return current.astimezone(timezone.utc)
             current += timedelta(minutes=1)
         return None
 
-    def _matches_cron_value(
+    def _parse_cron_values(
         self,
-        value: int,
         expression: str,
         minimum: int,
         maximum: int,
-    ) -> bool:
+        *,
+        allow_seven_as_zero: bool = False,
+    ) -> set[int]:
         expr = expression.strip()
-        if expr == "*":
-            return True
-        if expr.startswith("*/"):
-            step = int(expr[2:])
-            return step > 0 and value % step == 0
-
         allowed: set[int] = set()
         for part in expr.split(","):
             part = part.strip()
             if not part:
-                continue
-            if "-" in part:
-                start_text, end_text = part.split("-", 1)
-                start = max(minimum, int(start_text))
-                end = min(maximum, int(end_text))
-                allowed.update(range(start, end + 1))
+                raise ValueError("invalid cron expression")
+
+            range_part = part
+            step = 1
+            if "/" in part:
+                range_part, step_text = part.split("/", 1)
+                step = int(step_text)
+                if step <= 0:
+                    raise ValueError("invalid cron step")
+
+            if range_part == "*":
+                start = minimum
+                end = maximum
+            elif "-" in range_part:
+                start_text, end_text = range_part.split("-", 1)
+                start = self._normalize_cron_value(
+                    int(start_text),
+                    minimum=minimum,
+                    maximum=maximum,
+                    allow_seven_as_zero=allow_seven_as_zero,
+                )
+                end = self._normalize_cron_value(
+                    int(end_text),
+                    minimum=minimum,
+                    maximum=maximum,
+                    allow_seven_as_zero=allow_seven_as_zero,
+                )
+                if start > end:
+                    raise ValueError("invalid cron range")
             else:
-                numeric = int(part)
-                if minimum <= numeric <= maximum:
-                    allowed.add(numeric)
-        return value in allowed
+                numeric = self._normalize_cron_value(
+                    int(range_part),
+                    minimum=minimum,
+                    maximum=maximum,
+                    allow_seven_as_zero=allow_seven_as_zero,
+                )
+                start = numeric
+                end = numeric
+
+            allowed.update(range(start, end + 1, step))
+
+        return allowed
+
+    def _normalize_cron_value(
+        self,
+        value: int,
+        *,
+        minimum: int,
+        maximum: int,
+        allow_seven_as_zero: bool = False,
+    ) -> int:
+        if allow_seven_as_zero and value == 7:
+            value = 0
+        if value < minimum or value > maximum:
+            raise ValueError("cron value out of range")
+        return value
+
+    def _matches_cron_day(
+        self,
+        current: datetime,
+        *,
+        day_of_month_values: set[int],
+        day_of_week_values: set[int],
+        day_of_month_expr: str,
+        day_of_week_expr: str,
+    ) -> bool:
+        day_of_month_matches = current.day in day_of_month_values
+        current_day_of_week = (current.weekday() + 1) % 7
+        day_of_week_matches = current_day_of_week in day_of_week_values
+
+        day_of_month_is_wildcard = day_of_month_expr.strip() == "*"
+        day_of_week_is_wildcard = day_of_week_expr.strip() == "*"
+
+        if day_of_month_is_wildcard and day_of_week_is_wildcard:
+            return True
+        if day_of_month_is_wildcard:
+            return day_of_week_matches
+        if day_of_week_is_wildcard:
+            return day_of_month_matches
+        return day_of_month_matches or day_of_week_matches
 
     def _build_account_overview(
         self,

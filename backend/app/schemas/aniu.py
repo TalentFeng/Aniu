@@ -41,6 +41,38 @@ class AppSettingsUpdate(AppSettingsBase):
     pass
 
 
+class SkillListItemRead(BaseModel):
+    id: str
+    name: str
+    description: str
+    source: Literal["builtin", "workspace"]
+    enabled: bool
+
+
+class SkillInfoRead(SkillListItemRead):
+    location: str
+    has_handler: bool
+    tool_names: list[str] = Field(default_factory=list)
+    run_types: list[str] = Field(default_factory=list)
+    category: str | None = None
+    compatibility_level: Literal["native", "prompt_only", "needs_attention"]
+    compatibility_summary: str
+    issues: list[str] = Field(default_factory=list)
+    support_files: list[str] = Field(default_factory=list)
+    clawhub_slug: str | None = None
+    clawhub_version: str | None = None
+    clawhub_url: str | None = None
+    published_at: datetime | None = None
+
+
+class SkillImportClawHubRequest(BaseModel):
+    slug_or_url: str = Field(min_length=1, max_length=512)
+
+
+class SkillImportSkillHubRequest(BaseModel):
+    slug_or_url: str = Field(min_length=1, max_length=512)
+
+
 class ScheduleBase(BaseModel):
     name: str = Field(default="默认任务", max_length=64)
     run_type: Literal["analysis", "trade"] = "analysis"
@@ -87,6 +119,9 @@ class ApiDetailRead(BaseModel):
     name: str
     summary: str
     preview_index: int | None = None
+    tool_call_id: str | None = None
+    status: Literal["running", "done", "failed"] | None = None
+    ok: bool | None = None
 
 
 class RawToolPreviewRead(BaseModel):
@@ -108,6 +143,8 @@ class TradeDetailRead(BaseModel):
     summary: str
     tool_name: str | None = None
     preview_index: int | None = None
+    status: Literal["running", "done", "failed"] | None = None
+    ok: bool | None = None
 
 
 class RunSummaryRead(BaseModel):
@@ -250,22 +287,84 @@ class AccountOverviewDebugRead(AccountOverviewRead):
     raw_orders: dict[str, Any] | None = None
 
 
+class ChatAttachmentRef(BaseModel):
+    """Reference to a previously uploaded attachment.
+
+    Accepted in chat requests; the backend resolves metadata from DB.
+    """
+
+    id: int = Field(ge=1)
+
+
+class ChatAttachmentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    filename: str
+    mime_type: str
+    size: int
+    url: str | None = None
+
+
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(system|user|assistant)$")
-    content: str = Field(min_length=1, max_length=50000)
+    content: str = Field(default="", max_length=50000)
+    tool_calls: list[dict[str, Any]] | None = None
+    attachments: list[ChatAttachmentRead] | None = None
 
 
 class ChatRequest(BaseModel):
+    """Legacy stateless chat request (kept for backward compatibility)."""
+
     messages: list[ChatMessage] = Field(default_factory=list, min_length=1)
-    include_system_prompt: bool = True
-    include_account_summary: bool = True
-    include_positions_orders: bool = False
-    include_latest_run_summary: bool = False
 
 
 class ChatResponse(BaseModel):
     message: ChatMessage
     context: dict[str, bool]
+
+
+class ChatStreamRequest(BaseModel):
+    session_id: int = Field(ge=1)
+    content: str = Field(min_length=1, max_length=50000)
+    attachment_ids: list[int] = Field(default_factory=list, max_length=12)
+
+
+class ChatSessionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
+
+
+class ChatSessionCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+
+
+class ChatSessionUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class ChatMessageRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    role: str
+    content: str
+    tool_calls: list[dict[str, Any]] | None = None
+    attachments: list[ChatAttachmentRead] | None = None
+    created_at: datetime
+
+
+class ChatSessionMessagesPageRead(BaseModel):
+    session: ChatSessionRead
+    messages: list[ChatMessageRead] = Field(default_factory=list)
+    next_before_id: int | None = None
+    has_more: bool = False
 
 
 class LoginRequest(BaseModel):

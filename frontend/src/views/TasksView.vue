@@ -8,6 +8,17 @@
                 <h2>运行记录</h2>
                 <p class="section-kicker">Run History</p>
               </div>
+              <div class="panel-head-actions">
+                <button
+                  class="button ghost small soft-header-button overview-refresh-button"
+                  :class="{ 'is-loading': manualRunning }"
+                  :disabled="manualRunning"
+                  :title="manualRunButtonTitle"
+                  @click="handleManualRun"
+                >
+                  {{ manualRunning ? '执行中…' : '手动执行' }}
+                </button>
+              </div>
             </div>
 
             <div v-if="analysisError" class="error-banner">{{ analysisError }}</div>
@@ -29,18 +40,29 @@
                     </button>
                   </div>
                 </div>
-                <div class="run-grid" v-if="todayRuns.length">
-                  <div 
-                    v-for="run in todayRuns" 
+                <div class="run-grid" v-if="todayRuns.length || livePlaceholderVisible">
+                  <div
+                    v-if="livePlaceholderVisible"
+                    class="run-card live-run-card"
+                    :class="{ active: liveFocused }"
+                    @click="focusLiveCard"
+                  >
+                    <div class="run-card-type">{{ liveRunTypeLabel }}</div>
+                    <div class="run-card-time">{{ formatShortTime(liveStartedAtIso) }}</div>
+                    <div class="run-card-duration">{{ liveElapsed }}</div>
+                    <div class="run-card-status dot-running"></div>
+                  </div>
+                  <div
+                    v-for="run in todayRuns"
                      :key="run.id"
                      class="run-card"
-                     :class="{ active: selectedRun?.id === run.id }"
-                     @click="handleSelectRun(run.id, todayRuns)"
+                     :class="{ active: isTodayRunActive(run.id), 'live-run-card': isTodayRunLive(run.id) }"
+                     @click="handleTodayRunSelect(run.id)"
                    >
                     <div class="run-card-type">{{ run.analysisType }}</div>
                     <div class="run-card-time">{{ formatShortTime(run.startTime) }}</div>
                     <div class="run-card-duration">{{ run.duration }}</div>
-                     <div class="run-card-status" :class="statusTone(run.status)"></div>
+                     <div class="run-card-status" :class="isTodayRunLive(run.id) ? 'dot-running' : statusTone(run.status)"></div>
                    </div>
                 </div>
                 <div v-else class="run-grid-empty">
@@ -80,7 +102,7 @@
                     v-for="run in historyRuns" 
                      :key="run.id"
                      class="run-card"
-                     :class="{ active: selectedRun?.id === run.id }"
+                     :class="{ active: !liveFocused && selectedRun?.id === run.id }"
                      @click="handleSelectRun(run.id, historyRuns)"
                    >
                     <div class="run-card-type">{{ run.analysisType }}</div>
@@ -111,29 +133,29 @@
             </div>
 
             <!-- 三列详情网格 -->
-            <div class="detail-grid" v-if="selectedRun">
+            <div class="detail-grid" v-if="detailGridVisible">
               <!-- 第一列：运行状态 -->
               <div class="detail-column status-column">
                 <h4 class="column-title">运行状态</h4>
                 <div class="detail-column-body">
                   <div class="stat-compact">
                     <div class="stat-main">
-                      <span class="time-value">{{ formatTime(selectedRun.startTime) }}</span>
-                      <span class="duration-value">{{ selectedRun.duration }}</span>
-                      <span class="status-dot" :class="'dot-' + statusTone(selectedRun.status)"></span>
+                      <span class="time-value">{{ formatTime(displayStatusStartTime) }}</span>
+                      <span class="duration-value">{{ displayStatusDuration }}</span>
+                      <span class="status-dot" :class="displayStatusDotClass"></span>
                     </div>
-                    <div class="token-row">
+                    <div v-if="displayTokenBarVisible" class="token-row">
                       <span class="token-item">
                         <i>输入</i>
-                        <b>{{ selectedRun.inputTokens || '0' }}</b>
+                        <b>{{ displayInputTokens }}</b>
                       </span>
                       <span class="token-item">
                         <i>输出</i>
-                        <b>{{ selectedRun.outputTokens || '1.2k' }}</b>
+                        <b>{{ displayOutputTokens }}</b>
                       </span>
                       <span class="token-item total">
                         <i>总量</i>
-                        <b>{{ selectedRun.totalTokens || '1.25k' }}</b>
+                        <b>{{ displayTotalTokens }}</b>
                       </span>
                     </div>
                   </div>
@@ -142,25 +164,33 @@
 
               <!-- 第二列：接口调用 -->
               <div class="detail-column api-column">
-                <h4 class="column-title">接口调用 ({{ selectedRun.apiCalls }})</h4>
+                <h4 class="column-title">接口调用 ({{ displayApiDetails.length }})</h4>
                 <div class="detail-column-body">
-                  <div class="compact-list analysis-compact-list" v-if="selectedRun.apiDetails.length">
-                    <button
-                      v-for="(api, idx) in selectedRun.apiDetails"
-                      :key="idx"
-                      type="button"
-                      class="compact-item api-item compact-item-button"
-                      :class="{ active: activePreviewIndex === api.preview_index }"
-                      @click="focusPreview(api.preview_index)"
-                    >
-                      <div class="compact-main api-main">
-                        <span class="item-name" :title="api.name">{{ api.name }}</span>
-                        <span class="item-summary" :title="api.summary">{{ api.summary }}</span>
-                      </div>
-                    </button>
+                  <div
+                    v-if="displayApiDetails.length"
+                    ref="apiListRef"
+                    class="compact-list analysis-compact-list stream-list-shell"
+                    @scroll="handleApiListScroll"
+                  >
+                    <TransitionGroup name="stream-reveal" tag="div" class="stream-list-group">
+                      <button
+                        v-for="(api, idx) in displayApiDetails"
+                        :key="getApiItemKey(api, idx)"
+                        type="button"
+                        class="compact-item api-item compact-item-button"
+                        :class="{ active: !liveVisible && activePreviewIndex === api.preview_index && api.preview_index !== null }"
+                        @click="focusPreview(api.preview_index)"
+                      >
+                        <div class="compact-main api-main">
+                          <span class="item-name" :title="api.name">{{ api.name }}</span>
+                          <span class="item-summary" :title="api.summary">{{ api.summary }}</span>
+                        </div>
+                        <span class="compact-item-status-dot" :class="getApiItemStatusClass(api)" aria-hidden="true"></span>
+                      </button>
+                    </TransitionGroup>
                   </div>
-                  <div v-else-if="selectedRun.detailLoaded" class="detail-empty-state">
-                    本次分析没有生成可展示的接口调用记录。
+                  <div v-else-if="liveVisible || selectedRun?.detailLoaded" class="detail-empty-state">
+                    {{ displayApiEmptyText }}
                   </div>
                 </div>
               </div>
@@ -169,36 +199,60 @@
               <div class="detail-column trade-column">
                 <h4 class="column-title">交易执行 ({{ displayTradeDetails.length }})</h4>
                 <div class="detail-column-body">
-                  <div class="compact-list analysis-compact-list" v-if="displayTradeDetails.length">
-                    <button
-                      v-for="(trade, idx) in displayTradeDetails"
-                      :key="idx"
-                      type="button"
-                      class="compact-item trade-item compact-item-button"
-                      :class="{ active: activePreviewIndex === trade.preview_index }"
-                      @click="focusPreview(trade.preview_index)"
-                    >
-                      <div class="compact-main trade-main">
-                        <span class="trade-text-action" :class="trade.action">{{ trade.action_text }}</span>
-                        <span class="trade-text-summary" :title="trade.summary">{{ trade.summary }}</span>
-                      </div>
-                    </button>
+                  <div
+                    v-if="displayTradeDetails.length"
+                    ref="tradeListRef"
+                    class="compact-list analysis-compact-list stream-list-shell"
+                    @scroll="handleTradeListScroll"
+                  >
+                    <TransitionGroup name="stream-reveal" tag="div" class="stream-list-group">
+                      <button
+                        v-for="(trade, idx) in displayTradeDetails"
+                        :key="getTradeItemKey(trade, idx)"
+                        type="button"
+                        class="compact-item trade-item compact-item-button"
+                        :class="{ active: !liveVisible && activePreviewIndex === trade.preview_index && trade.preview_index !== null }"
+                        @click="focusPreview(trade.preview_index)"
+                      >
+                        <div class="compact-main trade-main">
+                          <span class="trade-text-action" :class="trade.action">{{ trade.action_text }}</span>
+                          <span class="trade-text-summary" :title="trade.summary">{{ trade.summary }}</span>
+                        </div>
+                        <span class="compact-item-status-dot" :class="getTradeItemStatusClass(trade)" aria-hidden="true"></span>
+                      </button>
+                    </TransitionGroup>
                   </div>
-                  <div v-else-if="selectedRun.detailLoaded" class="detail-empty-state">
-                    本次分析没有生成可展示的模拟操作。
+                  <div v-else-if="liveVisible || selectedRun?.detailLoaded" class="detail-empty-state">
+                    {{ displayTradeEmptyText }}
                   </div>
                 </div>
               </div>
             </div>
 
-            <div v-if="selectedRunLoading" class="detail-empty-state">
+            <div v-if="selectedRunLoading && !liveVisible" class="detail-empty-state">
               正在加载本次运行详情...
             </div>
 
-             <!-- 分析输出内容 / 原始返回联动预览 -->
-             <div class="output-section" v-if="selectedRun?.output || activePreview">
+             <!-- 分析输出内容 / 原始返回联动预览 / 实时结论 -->
+             <div class="output-section" v-if="liveVisible || selectedRun?.output || activePreview">
                <div class="output-surface" @click="handleOutputSurfaceClick">
-                  <div v-if="activePreview" class="raw-output-content">
+                  <div
+                    v-if="liveVisible && liveOutputIsPlaceholder"
+                    ref="liveOutputRef"
+                    class="live-output-content"
+                    :class="{ 'is-placeholder': liveOutputIsPlaceholder }"
+                    @scroll="handleLiveOutputScroll"
+                  >
+                    {{ liveOutputText }}
+                  </div>
+                  <div
+                    v-else-if="liveVisible"
+                    ref="liveOutputRef"
+                    class="markdown-content live-markdown-content"
+                    @scroll="handleLiveOutputScroll"
+                    v-html="liveOutputHtml"
+                  ></div>
+                  <div v-else-if="activePreview" class="raw-output-content">
                     {{ activePreview.preview }}
                   </div>
                  <div v-else-if="renderedOutputLoading" class="detail-empty-state">
@@ -208,12 +262,12 @@
                </div>
               </div>
 
-            <div v-if="selectedRun?.status === 'failed'" class="error-banner">
-              当前记录执行失败，请优先检查后端运行日志、模型配置或妙想接口状态。
+            <div v-if="runErrorVisible" class="error-banner">
+              {{ runErrorMessage }}
             </div>
 
             <!-- 无数据提示 -->
-            <div v-if="!selectedRun" class="empty-state">
+            <div v-if="!detailGridVisible && !selectedRunLoading" class="empty-state">
               <p>当前没有可展示的运行详情。完成一次任务执行后，这里会显示完整分析结果。</p>
             </div>
           </section>
@@ -222,13 +276,37 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 
 import { useAnalysisRuns } from '@/composables/useAnalysisRuns'
+import { useRunStream } from '@/composables/useRunStream'
 import { api } from '@/services/api'
 import { useAppStore } from '@/stores/legacy'
 import { formatShortTime, formatTime, statusTone } from '@/utils/formatters'
-import type { RawToolPreview, TradeDetail } from '@/types'
+import type { ApiDetail, TradeDetail } from '@/types'
+
+const LIVE_MARKDOWN_RENDER_MIN_INTERVAL_MS = 32
+const LIVE_OUTPUT_LOADING_HTML = '<p class="live-output-loading">正在生成最终结论...</p>'
+
+let liveMarkdownRendererPromise: Promise<(content: string) => string> | null = null
+
+async function getLiveMarkdownRenderer() {
+  if (!liveMarkdownRendererPromise) {
+    liveMarkdownRendererPromise = Promise.all([
+      import('dompurify'),
+      import('marked'),
+    ]).then(([domPurifyModule, markedModule]) => {
+      const DOMPurify = domPurifyModule.default
+      const { marked } = markedModule
+      return (content: string) => {
+        const rawHtml = marked.parse(content)
+        return DOMPurify.sanitize(typeof rawHtml === 'string' ? rawHtml : '')
+      }
+    })
+  }
+
+  return liveMarkdownRendererPromise
+}
 
 const store = useAppStore()
 
@@ -250,6 +328,7 @@ const {
   renderedOutputLoading,
   loadInitialRuns,
   selectRun,
+  refreshRunDetail,
   loadHistoryRuns,
   loadMoreTodayRuns,
   loadMoreHistoryRuns,
@@ -260,130 +339,287 @@ const {
 })
 
 onMounted(() => {
-  loadInitialRuns()
+  loadInitialRuns({ syncSelection: !liveFocused.value })
+  if (!store.schedules.length) {
+    store.loadSchedule().catch(() => {})
+  }
+})
+
+const runStream = useRunStream()
+const {
+  liveActive,
+  liveElapsed,
+  liveOutputText,
+  manualRunning,
+  liveRunTypeLabel,
+  liveRunId,
+  liveFocused,
+  liveStartedAtIso,
+  liveVisible,
+  pendingPostRunId,
+} = runStream
+
+const livePlaceholderVisible = computed(() => {
+  if (!liveActive.value) return false
+  if (liveRunId.value === null) return true
+  return !todayRuns.value.some((item) => item.id === liveRunId.value)
+})
+
+const preMarketScheduleId = computed(() => {
+  const match = store.schedules.find((item) => item.name === '盘前分析')
+  return match?.id ?? null
+})
+
+const manualRunTypeText = computed(() => {
+  const match = preMarketScheduleId.value === null
+    ? null
+    : store.schedules.find((item) => item.id === preMarketScheduleId.value)
+
+  return match?.run_type === 'trade' ? '交易任务' : '分析任务'
+})
+
+const manualRunButtonTitle = computed(() =>
+  preMarketScheduleId.value === null
+    ? '未找到盘前分析任务，将使用默认调度执行'
+    : '手动执行一次盘前分析',
+)
+
+async function handleManualRun() {
+  if (manualRunning.value) return
+  const startedAt = Date.now()
+  manualRunning.value = true
+  liveFocused.value = true
+  try {
+    const { run_id } = await api.runNowStream(preMarketScheduleId.value ?? undefined)
+    runStream.start(run_id, {
+      startedAt,
+      runTypeLabel: manualRunTypeText.value,
+    }).catch((err) => {
+      console.error('[TasksView] stream start failed', err)
+    })
+  } catch (error) {
+    console.error('[TasksView] manual run failed', error)
+    manualRunning.value = false
+    liveFocused.value = false
+  }
+}
+
+function focusLiveCard() {
+  liveFocused.value = true
+  clearPreviewFocus()
+}
+
+function isTodayRunActive(runId: number) {
+  if (liveFocused.value && liveRunId.value === runId) {
+    return true
+  }
+  return !liveFocused.value && selectedRun.value?.id === runId
+}
+
+function isTodayRunLive(runId: number) {
+  return liveActive.value && liveRunId.value === runId
+}
+
+function handleTodayRunSelect(runId: number) {
+  if (liveRunId.value === runId && runStream.state.status !== 'idle') {
+    focusLiveCard()
+    return
+  }
+  handleSelectRun(runId, todayRuns.value)
+}
+
+async function reconcileFinishedRun() {
+  const runId = pendingPostRunId.value
+  if (runId === null) return
+  pendingPostRunId.value = null
+
+  const results = await Promise.allSettled([
+    loadInitialRuns({ syncSelection: false }),
+    refreshRunDetail(runId),
+    store.refreshAfterRunCompletion(),
+  ])
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (failed) {
+    console.error('[TasksView] post-run refresh failed', failed.reason)
+  }
+}
+
+watch(
+  () => runStream.state.status,
+  (status) => {
+    if (status === 'completed' || status === 'failed') {
+      void reconcileFinishedRun()
+    }
+  },
+)
+
+onMounted(() => {
+  // Replay the post-completion reconcile when returning to this view
+  // after a run finished while the component was unmounted.
+  if (pendingPostRunId.value !== null) {
+    void reconcileFinishedRun()
+  }
+})
+
+onBeforeUnmount(() => {
+  // Intentionally NOT stopping runStream here: the singleton keeps the SSE
+  // connection alive across route changes so returning to this tab
+  // still shows the live progress and the post-run refresh.
 })
 
 const historyDateInput = ref<HTMLInputElement | null>(null)
 const activePreviewIndex = ref<number | null>(null)
-const demoTradeDetails: TradeDetail[] = [
-  {
-    action: 'buy',
-    action_text: '模拟买入',
-    symbol: '000001',
-    name: '平安银行',
-    volume: 100,
-    price: 12.34,
-    amount: 1234,
-    summary: '示例买入000001共100股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_1',
-    preview_index: -1,
-  },
-  {
-    action: 'sell',
-    action_text: '模拟卖出',
-    symbol: '600519',
-    name: '贵州茅台',
-    volume: 10,
-    price: 1688,
-    amount: 16880,
-    summary: '示例卖出600519共10股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_2',
-    preview_index: -2,
-  },
-  {
-    action: 'buy',
-    action_text: '模拟买入',
-    symbol: '300750',
-    name: '宁德时代',
-    volume: 20,
-    price: 202.5,
-    amount: 4050,
-    summary: '示例买入300750共20股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_3',
-    preview_index: -3,
-  },
-  {
-    action: 'sell',
-    action_text: '模拟卖出',
-    symbol: '601318',
-    name: '中国平安',
-    volume: 200,
-    price: 41.26,
-    amount: 8252,
-    summary: '示例卖出601318共200股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_4',
-    preview_index: -4,
-  },
-  {
-    action: 'buy',
-    action_text: '模拟买入',
-    symbol: '002594',
-    name: '比亚迪',
-    volume: 15,
-    price: 221.18,
-    amount: 3317.7,
-    summary: '示例买入002594共15股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_5',
-    preview_index: -5,
-  },
-  {
-    action: 'sell',
-    action_text: '模拟卖出',
-    symbol: '688981',
-    name: '中芯国际',
-    volume: 60,
-    price: 103.91,
-    amount: 6234.6,
-    summary: '示例卖出688981共60股（仅用于样式验证）。',
-    tool_name: 'demo_trade_preview_6',
-    preview_index: -6,
-  },
-]
+const apiListRef = ref<HTMLElement | null>(null)
+const tradeListRef = ref<HTMLElement | null>(null)
+const liveOutputRef = ref<HTMLElement | null>(null)
+const liveRenderedOutputHtml = ref('')
+const shouldFollowApiScroll = ref(true)
+const shouldFollowTradeScroll = ref(true)
+const shouldFollowLiveOutputScroll = ref(true)
 
-const demoTradePreviews: RawToolPreview[] = demoTradeDetails.map((detail, index) => ({
-  preview_index: detail.preview_index ?? -(index + 1),
-  tool_name: detail.tool_name ?? `demo_trade_preview_${index + 1}`,
-  display_name: `示例交易执行返回 ${index + 1}`,
-  summary: '仅用于前端样式验证的本地示例，不会写入后端。',
-  preview: JSON.stringify(
-    {
-      code: '200',
-      message: '示例下单成功',
-      data: {
-        orderId: `DEMO-ORDER-00${index + 1}`,
-        action: detail.action.toUpperCase(),
-        symbol: detail.symbol,
-        name: detail.name,
-        quantity: detail.volume,
-        price: detail.price,
-        amount: detail.amount,
-        status: 'submitted',
-      },
-    },
-    null,
-    2,
-  ),
-}))
+let liveMarkdownFrameId: number | null = null
+let liveMarkdownLatestContent = ''
+let liveMarkdownLastRenderAt = 0
+let liveMarkdownRenderTicket = 0
+
+const detailGridVisible = computed(() => liveVisible.value || !!selectedRun.value)
+
+const displayStatusStartTime = computed(() =>
+  liveVisible.value ? liveStartedAtIso.value : selectedRun.value?.startTime ?? null,
+)
+
+const displayStatusDuration = computed(() =>
+  liveVisible.value ? liveElapsed.value : selectedRun.value?.duration ?? '--',
+)
+
+const displayTokenBarVisible = computed(() => liveVisible.value || !!selectedRun.value)
+
+const displayTokenSource = computed(() => {
+  if (!liveVisible.value) {
+    return selectedRun.value
+  }
+
+  if (selectedRun.value?.id === liveRunId.value) {
+    return selectedRun.value
+  }
+
+  return null
+})
+
+const displayInputTokens = computed(() => displayTokenSource.value?.inputTokens ?? '--')
+
+const displayOutputTokens = computed(() => displayTokenSource.value?.outputTokens ?? '--')
+
+const displayTotalTokens = computed(() => displayTokenSource.value?.totalTokens ?? '--')
+
+const displayStatusDotClass = computed(() => {
+  if (liveVisible.value) {
+    if (runStream.state.status === 'failed' || runStream.state.status === 'error') {
+      return 'dot-tone-error'
+    }
+    if (runStream.state.status === 'completed') {
+      return 'dot-tone-success'
+    }
+    return 'dot-running'
+  }
+
+  return `dot-${statusTone(selectedRun.value?.status ?? 'idle')}`
+})
+
+const displayApiDetails = computed<ApiDetail[]>(() => {
+  if (liveVisible.value) {
+    return runStream.state.apiDetails
+  }
+
+  return selectedRun.value?.apiDetails ?? []
+})
 
 const displayTradeDetails = computed<TradeDetail[]>(() => {
-  if (!selectedRun.value) {
-    return []
+  if (liveVisible.value) {
+    return runStream.state.tradeDetails
   }
-  if (selectedRun.value.tradeDetails.length > 0) {
-    return selectedRun.value.tradeDetails
-  }
-  if (!import.meta.env.DEV) {
-    return []
-  }
-  return demoTradeDetails
+
+  return selectedRun.value?.tradeDetails ?? []
 })
+
+const liveRunStillRunning = computed(
+  () => runStream.state.status === 'connecting' || runStream.state.status === 'running',
+)
+
+const displayApiEmptyText = computed(() =>
+  liveVisible.value
+    ? liveRunStillRunning.value
+      ? '正在等待接口调用...'
+      : '本次分析没有生成可展示的接口调用记录。'
+    : '本次分析没有生成可展示的接口调用记录。',
+)
+
+const displayTradeEmptyText = computed(() =>
+  liveVisible.value
+    ? liveRunStillRunning.value
+      ? '当前暂无交易执行记录。'
+      : '本次分析没有生成可展示的模拟操作。'
+    : '本次分析没有生成可展示的模拟操作。',
+)
+
+const liveOutputIsPlaceholder = computed(
+  () => liveVisible.value && !runStream.state.finalStarted,
+)
+
+const liveOutputHtml = computed(() => {
+  if (liveOutputIsPlaceholder.value) {
+    return ''
+  }
+  return liveRenderedOutputHtml.value || LIVE_OUTPUT_LOADING_HTML
+})
+
+const runErrorVisible = computed(() => {
+  if (liveVisible.value) {
+    return runStream.state.status === 'failed' || runStream.state.status === 'error'
+  }
+
+  return selectedRun.value?.status === 'failed'
+})
+
+const runErrorMessage = computed(() => {
+  if (liveVisible.value) {
+    return runStream.state.errorMessage || '当前实时执行失败，请优先检查后端运行日志、模型配置或事件流连接状态。'
+  }
+
+  return '当前记录执行失败，请优先检查后端运行日志、模型配置或妙想接口状态。'
+})
+
+function getApiItemKey(api: ApiDetail, idx: number) {
+  return api.stream_key || api.tool_call_id || `${api.tool_name}-${api.preview_index ?? 'live'}-${idx}`
+}
+
+function getApiItemStatusClass(api: ApiDetail) {
+  if (api.status === 'running') {
+    return 'is-running'
+  }
+  if (api.status === 'failed' || api.ok === false) {
+    return 'is-failed'
+  }
+  return 'is-success'
+}
+
+function getTradeItemStatusClass(trade: TradeDetail) {
+  if (trade.status === 'running') {
+    return 'is-running'
+  }
+  if (trade.status === 'failed' || trade.ok === false) {
+    return 'is-failed'
+  }
+  return 'is-success'
+}
+
+function getTradeItemKey(trade: TradeDetail, idx: number) {
+  return trade.stream_key || `${trade.action}-${trade.symbol}-${trade.preview_index ?? 'live'}-${idx}`
+}
 
 const activePreview = computed(() => {
   if (typeof activePreviewIndex.value !== 'number') {
     return null
-  }
-  if (activePreviewIndex.value < 0) {
-    return demoTradePreviews.find((item) => item.preview_index === activePreviewIndex.value) ?? null
   }
   if (!selectedRun.value) {
     return null
@@ -401,7 +637,7 @@ const historyDateDisplay = computed(() => {
     return '年/月/日'
   }
 
-  return `${year}年/${month}月/${day}日`
+  return `${year}/${month}/${day}`
 })
 
 function openHistoryDatePicker() {
@@ -424,7 +660,8 @@ function handleSelectRun(runId: number, runs: typeof todayRuns.value) {
   if (!target) {
     return
   }
-  void selectRun(target)
+  liveFocused.value = false
+  void selectRun(target, { force: target.id === liveRunId.value })
 }
 
 function focusPreview(index: number | null) {
@@ -436,6 +673,95 @@ function focusPreview(index: number | null) {
 
 function clearPreviewFocus() {
   activePreviewIndex.value = null
+}
+
+function isNearBottom(element: HTMLElement) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= 28
+}
+
+async function scrollContainerToBottom(
+  elementRef: typeof apiListRef,
+  followRef: typeof shouldFollowApiScroll,
+) {
+  await nextTick()
+  const element = elementRef.value
+  if (!element || !followRef.value) {
+    return
+  }
+  window.requestAnimationFrame(() => {
+    element.scrollTop = element.scrollHeight
+  })
+}
+
+function handleApiListScroll() {
+  const element = apiListRef.value
+  shouldFollowApiScroll.value = !element || isNearBottom(element)
+}
+
+function handleTradeListScroll() {
+  const element = tradeListRef.value
+  shouldFollowTradeScroll.value = !element || isNearBottom(element)
+}
+
+function handleLiveOutputScroll() {
+  const element = liveOutputRef.value
+  shouldFollowLiveOutputScroll.value = !element || isNearBottom(element)
+}
+
+function clearLiveMarkdownRenderFrame() {
+  if (liveMarkdownFrameId !== null) {
+    window.cancelAnimationFrame(liveMarkdownFrameId)
+    liveMarkdownFrameId = null
+  }
+}
+
+async function renderLiveMarkdown(content: string, ticket: number) {
+  const renderMarkdown = await getLiveMarkdownRenderer()
+  if (ticket !== liveMarkdownRenderTicket) {
+    return
+  }
+  liveRenderedOutputHtml.value = content
+    ? renderMarkdown(content)
+    : LIVE_OUTPUT_LOADING_HTML
+}
+
+function flushLiveMarkdownRender(frameTime: number) {
+  liveMarkdownFrameId = null
+
+  if (frameTime - liveMarkdownLastRenderAt < LIVE_MARKDOWN_RENDER_MIN_INTERVAL_MS) {
+    liveMarkdownFrameId = window.requestAnimationFrame(flushLiveMarkdownRender)
+    return
+  }
+
+  liveMarkdownLastRenderAt = frameTime
+  liveMarkdownRenderTicket += 1
+  const ticket = liveMarkdownRenderTicket
+  const content = liveMarkdownLatestContent
+
+  void renderLiveMarkdown(content, ticket).finally(() => {
+    if (ticket !== liveMarkdownRenderTicket) {
+      return
+    }
+    if (content !== liveMarkdownLatestContent && liveMarkdownFrameId === null) {
+      liveMarkdownFrameId = window.requestAnimationFrame(flushLiveMarkdownRender)
+    }
+  })
+}
+
+function scheduleLiveMarkdownRender(content: string) {
+  liveMarkdownLatestContent = content
+  if (liveMarkdownFrameId !== null) {
+    return
+  }
+  liveMarkdownFrameId = window.requestAnimationFrame(flushLiveMarkdownRender)
+}
+
+function resetLiveMarkdownRenderState() {
+  clearLiveMarkdownRenderFrame()
+  liveMarkdownRenderTicket += 1
+  liveMarkdownLatestContent = ''
+  liveMarkdownLastRenderAt = 0
+  liveRenderedOutputHtml.value = ''
 }
 
 function handleOutputSurfaceClick(event: MouseEvent) {
@@ -469,12 +795,71 @@ watch(
   { immediate: true },
 )
 
+watch(
+  () => displayApiDetails.value.length,
+  (nextLength, previousLength = 0) => {
+    if (!liveVisible.value || nextLength <= previousLength) {
+      return
+    }
+    void scrollContainerToBottom(apiListRef, shouldFollowApiScroll)
+  },
+)
+
+watch(
+  () => displayTradeDetails.value.length,
+  (nextLength, previousLength = 0) => {
+    if (!liveVisible.value || nextLength <= previousLength) {
+      return
+    }
+    void scrollContainerToBottom(tradeListRef, shouldFollowTradeScroll)
+  },
+)
+
+watch(
+  () => liveOutputIsPlaceholder.value ? liveOutputText.value : liveOutputHtml.value,
+  (nextValue, previousValue = '') => {
+    if (!liveVisible.value || nextValue === previousValue) {
+      return
+    }
+    void scrollContainerToBottom(liveOutputRef, shouldFollowLiveOutputScroll)
+  },
+)
+
+watch(
+  () => [liveVisible.value, runStream.state.finalStarted, runStream.state.finalAnswer] as const,
+  ([visible, finalStarted, content]) => {
+    if (!visible || !finalStarted) {
+      resetLiveMarkdownRenderState()
+      return
+    }
+    void getLiveMarkdownRenderer()
+    scheduleLiveMarkdownRender(content)
+  },
+  { immediate: true },
+)
+
+watch(
+  () => liveVisible.value,
+  (visible) => {
+    if (!visible) {
+      return
+    }
+    shouldFollowApiScroll.value = true
+    shouldFollowTradeScroll.value = true
+    shouldFollowLiveOutputScroll.value = true
+    void scrollContainerToBottom(apiListRef, shouldFollowApiScroll)
+    void scrollContainerToBottom(tradeListRef, shouldFollowTradeScroll)
+    void scrollContainerToBottom(liveOutputRef, shouldFollowLiveOutputScroll)
+  },
+)
+
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  resetLiveMarkdownRenderState()
 })
 
 </script>
@@ -483,9 +868,8 @@ onBeforeUnmount(() => {
 .compact-item-button {
   width: 100%;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 6px;
-  height: 25px;
   min-height: 25px;
   padding: 5px 8px;
   box-sizing: border-box;
@@ -535,6 +919,70 @@ onBeforeUnmount(() => {
 .analysis-compact-list {
   height: calc(25px * 3 + 4px * 2);
   min-height: calc(25px * 3 + 4px * 2);
+}
+
+.stream-list-shell {
+  padding-right: 2px;
+}
+
+.stream-list-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 100%;
+}
+
+.stream-reveal-enter-active {
+  transition:
+    opacity 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    filter 0.28s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: left center;
+}
+
+.stream-reveal-enter-from {
+  opacity: 0;
+  transform: translateY(10px) scale(0.92);
+  filter: saturate(0.72) brightness(0.95);
+  box-shadow: 0 0 0 rgba(15, 23, 42, 0);
+}
+
+.stream-reveal-enter-to {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: saturate(1) brightness(1);
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.18);
+}
+
+.stream-reveal-move {
+  transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.compact-item-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  align-self: center;
+  border-radius: 999px;
+  background: rgba(74, 222, 128, 0.92);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.5);
+}
+
+.compact-item-status-dot.is-running {
+  background: #31d69f;
+  box-shadow: 0 0 10px rgba(49, 214, 159, 0.68);
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
+
+.compact-item-status-dot.is-success {
+  background: rgba(74, 222, 128, 0.96);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.42);
+}
+
+.compact-item-status-dot.is-failed {
+  background: rgba(248, 113, 113, 0.96);
+  box-shadow: 0 0 8px rgba(248, 113, 113, 0.42);
 }
 
 .trade-text-summary {
@@ -593,6 +1041,11 @@ onBeforeUnmount(() => {
 
 .markdown-content :deep(p:last-child) {
   margin-bottom: 0;
+}
+
+.live-markdown-content :deep(.live-output-loading) {
+  margin: 0;
+  color: #8ea4c5;
 }
 
 .raw-output-content {

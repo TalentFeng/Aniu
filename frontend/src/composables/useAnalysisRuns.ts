@@ -165,15 +165,30 @@ function mapApiDetails(detail: RunDetail): ApiDetail[] {
   return toolCalls
     .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
     .filter((item) => !tradeToolNames.has(String(item.name ?? '')))
-    .map((item) => {
+    .map((item, idx) => {
       const toolText = getApiToolText(String(item.name ?? ''))
+      const result = item.result && typeof item.result === 'object'
+        ? item.result as Record<string, unknown>
+        : null
+      const ok = typeof result?.ok === 'boolean' ? result.ok : null
       return {
         tool_name: String(item.name ?? ''),
         name: toolText.label,
         summary: toolText.summary,
-        preview_index: null,
+        preview_index: idx,
+        tool_call_id: typeof item.id === 'string' ? item.id : null,
+        status: ok === false ? 'failed' : 'done',
+        ok,
       }
     })
+}
+
+function resolveTradeDetailStatus(value: unknown): 'done' | 'failed' {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (text && ['fail', 'error', 'reject'].some((flag) => text.includes(flag))) {
+    return 'failed'
+  }
+  return 'done'
 }
 
 function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Record<string, unknown>> | null): TradeDetail[] {
@@ -183,6 +198,7 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
       const action = String(order.action).toUpperCase() === 'SELL' ? 'sell' : 'buy'
       const name = extractTradeName(order.response_payload) || order.symbol
       const amount = price == null ? null : Number((price * order.quantity).toFixed(2))
+      const status = resolveTradeDetailStatus(order.status)
       return {
         action,
         action_text: action === 'sell' ? '模拟卖出' : '模拟买入',
@@ -194,6 +210,8 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
         summary: getTradeSummary(action, order.symbol, name, order.quantity, price, amount),
         tool_name: null,
         preview_index: null,
+        status,
+        ok: status !== 'failed',
       }
     })
   }
@@ -208,6 +226,7 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
     const symbol = String(action.symbol ?? '--')
     const name = String(action.name ?? '').trim() || symbol
     const amount = price == null ? null : Number((price * volume).toFixed(2))
+    const status = resolveTradeDetailStatus(action.status)
     return {
       action: actionType,
       action_text: actionName === 'SELL' ? '模拟卖出' : '模拟买入',
@@ -219,6 +238,8 @@ function mapTradeDetails(tradeOrders: TradeOrder[], executedActions: Array<Recor
       summary: getTradeSummary(actionType, symbol, name, volume, price, amount),
       tool_name: null,
       preview_index: null,
+      status,
+      ok: status !== 'failed',
     }
     })
 }
@@ -294,7 +315,7 @@ function getLatestRun(runs: AnalysisRunViewModel[]) {
 
 export function useAnalysisRuns(options: {
   listRunsPage: (options?: { limit?: number, date?: string, status?: string, beforeId?: number }) => Promise<RunSummaryPage>
-  loadRunDetail: (runId: number) => Promise<RunDetail>
+  loadRunDetail: (runId: number, options?: { force?: boolean }) => Promise<RunDetail>
 }) {
   const selectedRun = ref<AnalysisRunViewModel | null>(null)
   const selectedRunLoading = ref(false)
@@ -330,11 +351,11 @@ export function useAnalysisRuns(options: {
     return runs.filter(shouldIncludeRun)
   }
 
-  async function hydrateSelectedRun(runId: number) {
+  async function hydrateSelectedRun(runId: number, force = false) {
     selectedRunLoading.value = true
 
     try {
-      const detail = await ensureRunDetail(runId)
+      const detail = await ensureRunDetail(runId, force)
       if (selectedRun.value?.id === runId) {
         selectedRun.value = detail
       }
@@ -361,18 +382,27 @@ export function useAnalysisRuns(options: {
     selectedRunLoading.value = false
   }
 
-  async function ensureRunDetail(runId: number) {
-    if (runCache.has(runId)) {
+  async function ensureRunDetail(runId: number, force = false) {
+    if (!force && runCache.has(runId)) {
       return runCache.get(runId)!
     }
 
-    const detail = await options.loadRunDetail(runId)
+    const detail = await options.loadRunDetail(runId, { force })
     const mapped = mapRunDetailToViewModel(detail)
     runCache.set(runId, mapped)
     return mapped
   }
 
-  async function loadInitialRuns() {
+  async function refreshRunDetail(runId: number) {
+    const detail = await ensureRunDetail(runId, true)
+    if (selectedRun.value?.id === runId) {
+      selectedRun.value = detail
+    }
+    return detail
+  }
+
+  async function loadInitialRuns(config: { syncSelection?: boolean } = {}) {
+    const { syncSelection = true } = config
     loading.value = true
     errorMessage.value = ''
 
@@ -389,7 +419,9 @@ export function useAnalysisRuns(options: {
       todayFailedCount.value = todaysSummaries.filter((run) => run.status === 'failed').length
       todayRuns.value = filterVisibleRuns(mappedTodayRuns)
 
-      await syncSelectedRun(todayRuns.value)
+      if (syncSelection) {
+        await syncSelectedRun(todayRuns.value)
+      }
     } catch (error) {
       errorMessage.value = (error as Error).message
       todayRuns.value = []
@@ -401,14 +433,14 @@ export function useAnalysisRuns(options: {
     }
   }
 
-  async function selectRun(run: AnalysisRunViewModel) {
+  async function selectRun(run: AnalysisRunViewModel, options?: { force?: boolean }) {
     selectedRun.value = run
-    if (run.detailLoaded) {
+    if (run.detailLoaded && !options?.force) {
       selectedRunLoading.value = false
       return
     }
 
-    await hydrateSelectedRun(run.id)
+    await hydrateSelectedRun(run.id, options?.force === true)
   }
 
   async function loadHistoryRuns() {
@@ -589,6 +621,7 @@ export function useAnalysisRuns(options: {
     historyHasMore,
     loadInitialRuns,
     selectRun,
+    refreshRunDetail,
     loadHistoryRuns,
     loadMoreTodayRuns,
     loadMoreHistoryRuns,

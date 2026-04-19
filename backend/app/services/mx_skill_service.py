@@ -47,29 +47,26 @@ _QUERY_TEMPLATES: dict[str, list[str]] = {
     ],
 }
 
+_COMMON_TOOL_NAMES: set[str] = {
+    "mx_query_market",
+    "mx_search_news",
+    "mx_screen_stocks",
+    "mx_get_positions",
+    "mx_get_balance",
+    "mx_get_orders",
+    "mx_get_self_selects",
+    "mx_manage_self_select",
+}
+
+_TRADE_TOOL_NAMES: set[str] = {
+    "mx_moni_trade",
+    "mx_moni_cancel",
+}
+
 _TOOL_PROFILES: dict[str, set[str]] = {
-    "analysis": {
-        "mx_query_market",
-        "mx_search_news",
-        "mx_screen_stocks",
-        "mx_get_positions",
-        "mx_get_balance",
-        "mx_get_orders",
-        "mx_get_self_selects",
-        "mx_manage_self_select",
-    },
-    "trade": {
-        "mx_query_market",
-        "mx_search_news",
-        "mx_screen_stocks",
-        "mx_get_positions",
-        "mx_get_balance",
-        "mx_get_orders",
-        "mx_get_self_selects",
-        "mx_manage_self_select",
-        "mx_moni_trade",
-        "mx_moni_cancel",
-    },
+    "analysis": set(_COMMON_TOOL_NAMES),
+    "trade": {*_COMMON_TOOL_NAMES, *_TRADE_TOOL_NAMES},
+    "chat": {*_COMMON_TOOL_NAMES, *_TRADE_TOOL_NAMES},
 }
 
 

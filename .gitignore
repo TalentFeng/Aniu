@@ -53,3 +53,19 @@ temp/
 *.tar
 *.tar.gz
 *.tgz
+
+# Local runtime data
+/data/
+backend/data/chat_uploads/
+backend/data/skill_workspace/
+
+# Local tool config
+.claude/
+
+# Local notes / scratch files
+/bug-indexed-cupcake.md
+/c-users-83477-desktop-vibe-coding-chatb-cosmic-kitten.md
+
+# Personal local scripts
+/dev.bat
+/setup.bat

@@ -81,7 +81,7 @@
                         </div>
                       </div>
                       <div class="task-field">
-                        <span class="field-label">分析提示词 <small>{{ scheduleSettings.preMarket.prompt.length }}字</small></span>
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.preMarket.prompt.length }}字</small></span>
                         <textarea 
                           v-model="scheduleSettings.preMarket.prompt" 
                           rows="3"
@@ -122,7 +122,7 @@
                         </div>
                       </div>
                       <div class="task-field">
-                        <span class="field-label">分析提示词 <small>{{ scheduleSettings.midday.prompt.length }}字</small></span>
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.midday.prompt.length }}字</small></span>
                         <textarea 
                           v-model="scheduleSettings.midday.prompt" 
                           rows="3"
@@ -163,7 +163,7 @@
                         </div>
                       </div>
                       <div class="task-field">
-                        <span class="field-label">分析提示词 <small>{{ scheduleSettings.postMarket.prompt.length }}字</small></span>
+                        <span class="field-label">提示词 <small>{{ scheduleSettings.postMarket.prompt.length }}字</small></span>
                         <textarea 
                           v-model="scheduleSettings.postMarket.prompt" 
                           rows="3"
@@ -215,7 +215,7 @@
                       </div>
                     </div>
                     <div class="run-prompt">
-                      <span class="prompt-label">分析提示词 <small>{{ scheduleSettings.morning.prompt.length }}字</small></span>
+                      <span class="prompt-label">提示词 <small>{{ scheduleSettings.morning.prompt.length }}字</small></span>
                       <textarea 
                         v-model="scheduleSettings.morning.prompt" 
                         rows="2"
@@ -256,7 +256,7 @@
                       </div>
                     </div>
                     <div class="run-prompt">
-                      <span class="prompt-label">分析提示词 <small>{{ scheduleSettings.afternoon.prompt.length }}字</small></span>
+                      <span class="prompt-label">提示词 <small>{{ scheduleSettings.afternoon.prompt.length }}字</small></span>
                       <textarea 
                         v-model="scheduleSettings.afternoon.prompt" 
                         rows="2"

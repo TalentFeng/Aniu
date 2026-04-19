@@ -60,6 +60,10 @@ export interface ApiDetail {
   name: string
   summary: string
   preview_index: number | null
+  tool_call_id?: string | null
+  status?: 'running' | 'done' | 'failed' | null
+  ok?: boolean | null
+  stream_key?: string | null
 }
 
 export interface RawToolPreview {
@@ -81,6 +85,9 @@ export interface TradeDetail {
   summary: string
   tool_name: string | null
   preview_index: number | null
+  status?: 'running' | 'done' | 'failed' | null
+  ok?: boolean | null
+  stream_key?: string | null
 }
 
 export interface RunSummaryPage {
@@ -194,22 +201,64 @@ export interface AccountOverview {
   errors: string[]
 }
 
+export interface ChatToolCall {
+  tool_call_id?: string | null
+  tool_name: string
+  status: 'running' | 'done'
+  ok?: boolean
+  summary?: string
+  arguments?: unknown
+  started_at: number
+  finished_at?: number
+}
+
+export interface ChatAttachment {
+  id: number
+  filename: string
+  mime_type: string
+  size: number
+  url: string
+}
+
 export interface ChatMessage {
+  id?: number
   role: 'user' | 'assistant' | 'system'
   content: string
+  tool_calls?: ChatToolCall[]
+  attachments?: ChatAttachment[]
+  created_at?: string
+  pending?: boolean
 }
 
 export interface ChatRequest {
   messages: ChatMessage[]
-  include_system_prompt: boolean
-  include_account_summary: boolean
-  include_positions_orders: boolean
-  include_latest_run_summary: boolean
 }
 
 export interface ChatResponse {
   message: ChatMessage
   context: Record<string, boolean>
+}
+
+export interface ChatSession {
+  id: number
+  title: string
+  created_at: string
+  updated_at: string
+  last_message_at: string | null
+  message_count: number
+}
+
+export interface ChatSessionMessagesPayload {
+  session: ChatSession
+  messages: ChatMessage[]
+  next_before_id: number | null
+  has_more: boolean
+}
+
+export interface ChatStreamRequest {
+  session_id: number
+  content: string
+  attachment_ids?: number[]
 }
 
 export interface LoginRequest {
@@ -219,4 +268,35 @@ export interface LoginRequest {
 export interface LoginResponse {
   authenticated: boolean
   token: string | null
+}
+
+export type SkillCompatibilityLevel = 'native' | 'prompt_only' | 'needs_attention'
+
+export interface SkillListItem {
+  id: string
+  name: string
+  description: string
+  source: 'builtin' | 'workspace'
+  enabled: boolean
+}
+
+export interface SkillInfo {
+  id: string
+  name: string
+  description: string
+  location: string
+  source: 'builtin' | 'workspace'
+  enabled: boolean
+  has_handler: boolean
+  tool_names: string[]
+  run_types: string[]
+  category: string | null
+  compatibility_level: SkillCompatibilityLevel
+  compatibility_summary: string
+  issues: string[]
+  support_files: string[]
+  clawhub_slug: string | null
+  clawhub_version: string | null
+  clawhub_url: string | null
+  published_at: string | null
 }

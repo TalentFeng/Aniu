@@ -2,7 +2,7 @@
 
 # Aniu
 
-<img width="120" alt="Image" src="./icon.png" />
+<img width="120" alt="Aniu icon" src="./frontend/public/aniu.ico" />
 
 </div>
 

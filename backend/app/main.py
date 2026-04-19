@@ -15,8 +15,11 @@ from app.api.router import router as aniu_router
 from app.core.config import get_settings
 from app.core.rate_limit import rate_limit_middleware
 from app.db.database import init_db
+from app.db.database import session_scope
 from app.services.scheduler_service import scheduler_service
+from app.services.skill_admin_service import skill_admin_service
 from app.services.trading_calendar_service import trading_calendar_service
+from app.skills import skill_registry
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,9 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     init_db()
+    skill_registry.reload()
+    with session_scope() as db:
+        skill_admin_service.apply_persisted_state(db)
     current_year = date.today().year
     trading_calendar_service.ensure_years([current_year])
     try:

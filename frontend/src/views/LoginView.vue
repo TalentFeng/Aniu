@@ -20,6 +20,17 @@
           <input v-model="rememberCredentials" type="checkbox" />
           <span>默认记住密码</span>
         </label>
+        <p class="login-remember-hint">
+          记住密码会将密码保存在当前浏览器中。共享设备或存在脚本风险时请勿启用。
+        </p>
+        <button
+          v-if="hasRememberedPassword"
+          type="button"
+          class="button ghost small login-clear-remembered"
+          @click="clearRememberedPassword"
+        >
+          清除已记住密码
+        </button>
 
         <p v-if="errorMessage" class="login-error">{{ errorMessage }}</p>
 
@@ -36,31 +47,50 @@ import { useRouter } from 'vue-router'
 import {
   api,
   clearStoredLoginFlag,
+  clearStoredLoginNotice,
   clearStoredToken,
+  consumeStoredLoginNotice,
+  consumeStoredLoginRedirect,
   getStoredLoginFlag,
   getStoredToken,
   setStoredLoginFlag,
   setStoredToken,
 } from '@/services/api'
-import { useAppStore } from '@/stores/legacy'
 import {
   REMEMBERED_PASSWORD_STORAGE_KEY,
 } from '@/constants'
 
-const store = useAppStore()
 const router = useRouter()
 const password = ref('')
 const rememberCredentials = ref(true)
+const hasRememberedPassword = ref(false)
 const errorMessage = ref('')
 const submitting = ref(false)
 
+function resolvePostLoginPath() {
+  return consumeStoredLoginRedirect() || '/overview'
+}
+
 onMounted(() => {
   password.value = window.localStorage.getItem(REMEMBERED_PASSWORD_STORAGE_KEY) ?? ''
+  hasRememberedPassword.value = password.value.length > 0
+  const pendingNotice = consumeStoredLoginNotice()
+  if (pendingNotice) {
+    errorMessage.value = pendingNotice
+  }
 
   if (getStoredLoginFlag() && getStoredToken()) {
-    router.replace('/overview')
+    router.replace(resolvePostLoginPath())
   }
 })
+
+function clearRememberedPassword() {
+  window.localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY)
+  hasRememberedPassword.value = false
+  if (rememberCredentials.value) {
+    rememberCredentials.value = false
+  }
+}
 
 async function handleSubmit() {
   if (!password.value.trim()) {
@@ -80,10 +110,14 @@ async function handleSubmit() {
     setStoredLoginFlag(response.authenticated)
     if (rememberCredentials.value) {
       window.localStorage.setItem(REMEMBERED_PASSWORD_STORAGE_KEY, password.value)
+      hasRememberedPassword.value = true
+    } else {
+      window.localStorage.removeItem(REMEMBERED_PASSWORD_STORAGE_KEY)
+      hasRememberedPassword.value = false
     }
-    await store.initialize()
     errorMessage.value = ''
-    router.replace('/overview')
+    clearStoredLoginNotice()
+    router.replace(resolvePostLoginPath())
   } catch (error) {
     clearStoredToken()
     clearStoredLoginFlag()

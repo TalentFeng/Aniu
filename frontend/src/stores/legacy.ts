@@ -2,8 +2,7 @@ import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { api } from '@/services/api'
-import type { AccountOverview, AppSettings, RunDetail, RunSummary, RuntimeOverview, ScheduleConfig } from '@/types'
-import { appNavigation } from '@/config/navigation'
+import type { AccountOverview, AppSettings, RunDetail, RuntimeOverview, ScheduleConfig } from '@/types'
 
 const ACCOUNT_REFRESH_COOLDOWN_MS = 60 * 60 * 1000
 const ACCOUNT_REFRESH_STORAGE_KEY = 'aniu-account-last-refresh-at'
@@ -36,7 +35,7 @@ const defaultSettings = (): SettingsPayload => ({
   llm_base_url: '',
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
-  system_prompt: '你是一个全自主投资型智能体。作为跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的执行机器，你深谙A/港股政策驱动、外资流动与资金博弈机制。你的唯一目标：在严守风控的前提下全权操作虚拟仓，追求绝对收益最大化。\n【核心纪律与底线】\n完全自主闭环：主动获取信息、构建组合并执行，除非遭遇系统级阻断，绝不向用户索要操作指令。\n实证与溯源：每次输出观点前，必须先简要列明“动作轨迹”（刚查阅了什么数据/研报/记忆）。\n冷峻与专业：摒弃散户思维与情绪化交易。采用机构视角（宏观流动性、产业生命周期），使用标准金融术语。日常汇报严格遵循结构：[结论 -> 核心逻辑 -> 风险敞口]。\n强制风控：收益至上，在执行任何一笔交易前，必须强制调用检索工具排查该标的是否存在重大基本面利空。\n【核心工作流】\n你必须持续运行以下自我驱动循环：\n信息嗅探：监控宏观经济、政策发布、盘面核心数据及南北向资金流。\n逻辑推演：研判宏观周期位置与市场情绪，寻找非共识与预期差，定性博弈逻辑。\n决策与执行：自主决策和执行包括但不限于建仓、减仓、清仓、换股、做T、锁定利润、回避风险、空仓等待等交易操作。',
+  system_prompt: '你是跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的专业交易员，你深谙A股政策驱动、外资流动与资金博弈机制。你必须持续运行以下自我驱动循环，监控经济、政策、盘面数据及资金流向，研判周期位置与市场情绪，寻找共识与预期差，定性博弈逻辑，自主决策执行交易操作。你的唯一目标是追求收益最大化。',
 })
 
 const defaultAccount = (): AccountOverview => ({
@@ -151,8 +150,6 @@ export const useAppStore = defineStore('app', () => {
   const settings = reactive<SettingsPayload>(defaultSettings())
   const schedules = ref<ScheduleEditor[]>([])
   const account = ref<AccountOverview>(defaultAccount())
-  const runSummaries = ref<RunSummary[]>([])
-  const latestRun = ref<RunSummary | RunDetail | null>(null)
   const runtimeOverview = ref<RuntimeOverview>(defaultRuntimeOverview())
   const runDetailsMap = ref<Record<number, RunDetail>>({})
   const accountLastManualRefreshAt = ref(readLastAccountRefreshAt())
@@ -162,8 +159,6 @@ export const useAppStore = defineStore('app', () => {
   const accountRefreshing = ref(false)
   const notice = ref('')
   const errorMessage = ref('')
-  const initialized = ref(false)
-  const tabs = ref(appNavigation)
 
   const enabledTaskCount = computed(() => schedules.value.filter((task) => task.enabled).length)
   const accountPositionCount = computed(() => account.value.positions.length)
@@ -233,13 +228,8 @@ export const useAppStore = defineStore('app', () => {
     applySchedules(await api.getSchedule())
   }
 
-  async function refreshRunSummaries(options: number | { limit?: number, date?: string, status?: string, beforeId?: number } = 50) {
-    runSummaries.value = await api.listRuns(options)
-    return runSummaries.value
-  }
-
-  async function loadRunDetail(runId: number) {
-    if (runDetailsMap.value[runId]) {
+  async function loadRunDetail(runId: number, options?: { force?: boolean }) {
+    if (!options?.force && runDetailsMap.value[runId]) {
       return runDetailsMap.value[runId]
     }
     const detail = await api.getRun(runId)
@@ -250,9 +240,17 @@ export const useAppStore = defineStore('app', () => {
     return detail
   }
 
-  async function refreshLatestRun() {
-    await refreshRunSummaries(50)
-    latestRun.value = runSummaries.value[0] ?? null
+  async function refreshAfterRunCompletion() {
+    const results = await Promise.allSettled([
+      refreshAccountData(),
+      refreshRuntimeOverview(),
+      loadSchedule(),
+    ])
+
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failed) {
+      throw (failed.reason instanceof Error ? failed.reason : new Error('运行完成后的数据刷新失败'))
+    }
   }
 
   async function refreshRuntimeOverview() {
@@ -294,7 +292,7 @@ export const useAppStore = defineStore('app', () => {
         loadSettings(),
         loadSchedule(),
         refreshAccountData(),
-        refreshLatestRun(),
+        refreshRuntimeOverview(),
       ])
       const errors = results
         .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
@@ -314,8 +312,6 @@ export const useAppStore = defineStore('app', () => {
     Object.assign(settings, defaultSettings())
     schedules.value = []
     account.value = defaultAccount()
-    runSummaries.value = []
-    latestRun.value = null
     runtimeOverview.value = defaultRuntimeOverview()
     runDetailsMap.value = {}
     accountLastManualRefreshAt.value = readLastAccountRefreshAt()
@@ -324,7 +320,6 @@ export const useAppStore = defineStore('app', () => {
     accountRefreshing.value = false
     notice.value = ''
     errorMessage.value = ''
-    initialized.value = false
   }
 
   async function saveSettings() {
@@ -371,9 +366,8 @@ export const useAppStore = defineStore('app', () => {
 
     try {
       const run = await api.runNow(scheduleId)
-      latestRun.value = run
       notice.value = `任务运行完成：#${run.id} ${run.status}`
-      await Promise.all([refreshAccountData(), refreshLatestRun(), refreshRuntimeOverview(), loadSchedule()])
+      await Promise.all([refreshAccountData(), refreshRuntimeOverview(), loadSchedule()])
       return run
     } catch (error) {
       errorMessage.value = (error as Error).message
@@ -381,14 +375,6 @@ export const useAppStore = defineStore('app', () => {
     } finally {
       busy.value = false
     }
-  }
-
-  async function initialize() {
-    if (initialized.value) {
-      return
-    }
-
-    initialized.value = true
   }
 
   function touchAccountRefreshTick() {
@@ -399,12 +385,9 @@ export const useAppStore = defineStore('app', () => {
     settings,
     schedules,
     account,
-    runSummaries,
-    latestRun,
     busy,
     notice,
     errorMessage,
-    tabs,
     enabledTaskCount,
     accountPositionCount,
     activeScheduleCards,
@@ -417,9 +400,8 @@ export const useAppStore = defineStore('app', () => {
     applySchedules,
     loadSettings,
     loadSchedule,
-    refreshRunSummaries,
     loadRunDetail,
-    refreshLatestRun,
+    refreshAfterRunCompletion,
     refreshRuntimeOverview,
     refreshAccountData,
     refreshAccountDataWithCooldown,
@@ -428,7 +410,6 @@ export const useAppStore = defineStore('app', () => {
     saveSettings,
     saveSchedule,
     runNow,
-    initialize,
     resetState,
   }
 })

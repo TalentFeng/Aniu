@@ -1,10 +1,17 @@
 const BEIJING_TIMEZONE = 'Asia/Shanghai'
 
-function parseDateParts(isoStr: string | null | undefined) {
-  if (!isoStr) return null
+function parseDate(value: string | Date | null | undefined) {
+  if (!value) return null
 
-  const d = new Date(isoStr)
-  if (Number.isNaN(d.getTime())) return null
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+
+  return date
+}
+
+function parseDateParts(value: string | Date | null | undefined) {
+  const d = parseDate(value)
+  if (!d) return null
 
   const formatter = new Intl.DateTimeFormat('zh-CN', {
     timeZone: BEIJING_TIMEZONE,
@@ -28,6 +35,42 @@ function parseDateParts(isoStr: string | null | undefined) {
     minute: partMap.minute,
     second: partMap.second,
   }
+}
+
+function dayKeyToNumber(dayKey: string) {
+  const [year, month, day] = dayKey.split('-').map(Number)
+  return Math.floor(Date.UTC(year, month - 1, day) / 86400000)
+}
+
+export function getBeijingDateKey(value: string | Date | null | undefined): string | null {
+  const parts = parseDateParts(value)
+  if (!parts) return null
+  return `${parts.year}-${parts.month}-${parts.day}`
+}
+
+export function getBeijingDayDifference(
+  value: string | Date | null | undefined,
+  reference: string | Date | null | undefined = new Date(),
+): number | null {
+  const dayKey = getBeijingDateKey(value)
+  const referenceDayKey = getBeijingDateKey(reference)
+  if (!dayKey || !referenceDayKey) return null
+  return dayKeyToNumber(referenceDayKey) - dayKeyToNumber(dayKey)
+}
+
+export function formatChatSessionTime(
+  value: string | Date | null | undefined,
+  reference: string | Date | null | undefined = new Date(),
+): string {
+  const parts = parseDateParts(value)
+  if (!parts) return ''
+
+  const dayDifference = getBeijingDayDifference(value, reference)
+  if (dayDifference !== null && dayDifference <= 0) {
+    return `${parts.hour}:${parts.minute}`
+  }
+
+  return `${parts.month}-${parts.day}`
 }
 
 export function formatMoney(val: number | null | undefined): string {
@@ -64,8 +107,8 @@ export function formatMinuteTime(isoStr: string | null | undefined): string {
 export function formatWeekdayMinuteTime(isoStr: string | null | undefined): string {
   if (!isoStr) return '--'
 
-  const d = new Date(isoStr)
-  if (Number.isNaN(d.getTime())) {
+  const d = parseDate(isoStr)
+  if (!d) {
     return typeof isoStr === 'string' ? isoStr : '--'
   }
 

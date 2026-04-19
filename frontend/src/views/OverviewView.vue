@@ -12,9 +12,10 @@
                   class="button ghost small soft-header-button overview-refresh-button"
                   :class="{ 'is-loading': accountRefreshing }"
                   :disabled="accountRefreshing || !canManualRefreshAccount"
+                  :title="canManualRefreshAccount ? '手动刷新账户信息' : `${accountRefreshCooldownText}后可刷新`"
                   @click="handleManualRefresh"
                 >
-                  {{ canManualRefreshAccount ? '刷新' : `${accountRefreshCooldownText}后可刷新` }}
+                  {{ canManualRefreshAccount ? '刷新' : '冷却中' }}
                 </button>
               </div>
             </div>

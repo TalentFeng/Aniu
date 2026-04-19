@@ -10,7 +10,7 @@ from app.db.database import init_db
 from app.db.models import StrategySchedule
 from app.services.aniu_service import aniu_service
 from app.services.mx_skill_service import mx_skill_service
-from app.services.llm_service import llm_service
+from app.services.llm_service import LLMService, llm_service
 
 
 def test_execute_run_rejects_unknown_schedule_id(monkeypatch, tmp_path) -> None:
@@ -133,6 +133,68 @@ def test_build_initial_request_payload_uses_run_type_tool_profile() -> None:
 
     assert "mx_moni_trade" not in names
     assert "mx_query_market" in names
+
+
+def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> None:
+    service = LLMService()
+    created_timeouts: list[int] = []
+    client_ids: list[int] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_lines(self):
+            return iter(())
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            client_ids.append(id(self))
+            return FakeResponse()
+
+    def fake_create_http_client(timeout_seconds: int):
+        created_timeouts.append(timeout_seconds)
+        return FakeClient()
+
+    monkeypatch.setattr(service, "_create_http_client", fake_create_http_client)
+    monkeypatch.setattr(
+        service,
+        "_parse_llm_stream_response",
+        lambda *, lines, emit, cancel_event=None: {
+            "choices": [{"message": {"content": "ok"}}]
+        },
+    )
+
+    payload = {"messages": [], "model": "demo"}
+    service._consume_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload=payload,
+        timeout_seconds=5,
+    )
+    service._consume_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload=payload,
+        timeout_seconds=7,
+    )
+
+    assert created_timeouts == [5, 7]
+    assert len(client_ids) == 2
+    assert client_ids[0] != client_ids[1]
 
 
 def test_execute_tool_adds_guidance_for_api_key_error() -> None:
