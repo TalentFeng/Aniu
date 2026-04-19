@@ -1,4 +1,6 @@
-FROM node:20-slim AS frontend-build
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM node:20-slim AS frontend-build
 
 WORKDIR /build/frontend
 
