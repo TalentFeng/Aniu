@@ -385,18 +385,6 @@ textarea {
   accent-color: #58b9ff;
 }
 
-.login-remember-hint {
-  margin: -8px 0 0;
-  color: #7f93b2;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.login-clear-remembered {
-  align-self: flex-start;
-  margin-top: -6px;
-}
-
 .login-error {
   margin: -4px 0 0;
   color: #ff92ab;

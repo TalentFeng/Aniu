@@ -19,13 +19,9 @@ metadata:
 - `mx_screen_stocks`：自然语言选股
 - `mx_get_positions` / `mx_get_balance` / `mx_get_orders`：模拟组合持仓、资金、委托
 - `mx_get_self_selects` / `mx_manage_self_select`：自选股读取与维护
-- `mx_moni_trade` / `mx_moni_cancel`：A 股模拟交易下单与撤单（仅 `run_type=trade` 可见）
+- `mx_moni_trade` / `mx_moni_cancel`：A 股模拟交易下单与撤单
 
 ## 使用建议
 
-1. 分析类任务先调用 `mx_get_balance` + `mx_get_positions` 获取组合快照，再结合行情 / 资讯做判断。
-2. 交易前必须通过 `mx_query_market` 或 `mx_search_news` 验证标的当前无重大利空。
-3. 数量必须是 100 的整数倍；LIMIT 委托必须附带有效价格。
-4. 撤单优先按委托编号，撤单前建议先 `mx_get_orders` 查到最新 order_id。
-
-所有工具仅作用于已绑定的妙想模拟组合，不涉及真实资金。
+- 数量必须是 100 的整数倍；LIMIT 委托必须附带有效价格。
+- 撤单优先按委托编号，撤单前建议先 `mx_get_orders` 查到最新 order_id。

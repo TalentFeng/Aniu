@@ -22,6 +22,8 @@ export interface AnalysisRunViewModel {
   detailLoaded: boolean
 }
 
+const RUNS_PAGE_SIZE = 100
+
 function formatTokenValue(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? String(value) : '--'
 }
@@ -321,12 +323,6 @@ export function useAnalysisRuns(options: {
   const selectedRunLoading = ref(false)
   const renderedOutputHtml = ref('')
   const renderedOutputLoading = ref(false)
-  const todayLoadingMore = ref(false)
-  const historyLoadingMore = ref(false)
-  const todayHasMore = ref(false)
-  const historyHasMore = ref(false)
-  const todayNextBeforeId = ref<number | null>(null)
-  const historyNextBeforeId = ref<number | null>(null)
   const showFailedRuns = ref(false)
   const todayRuns = ref<AnalysisRunViewModel[]>([])
   const historyRuns = ref<AnalysisRunViewModel[]>([])
@@ -407,10 +403,8 @@ export function useAnalysisRuns(options: {
     errorMessage.value = ''
 
     try {
-      const page = await options.listRunsPage({ limit: 20 })
+      const page = await options.listRunsPage({ limit: RUNS_PAGE_SIZE })
       sourceSummaries.value = page.items
-      todayHasMore.value = page.has_more
-      todayNextBeforeId.value = page.next_before_id
       const today = new Date()
       const todaysSummaries = sourceSummaries.value.filter((item) => isSameDay(item.started_at, today))
       const mappedTodayRuns = todaysSummaries.map(mapRunSummaryToViewModel)
@@ -446,8 +440,6 @@ export function useAnalysisRuns(options: {
   async function loadHistoryRuns() {
     if (!selectedDate.value) {
       historyRuns.value = []
-      historyHasMore.value = false
-      historyNextBeforeId.value = null
       return
     }
 
@@ -455,13 +447,11 @@ export function useAnalysisRuns(options: {
 
     try {
       const page = await options.listRunsPage({
-        limit: 20,
+        limit: RUNS_PAGE_SIZE,
         date: selectedDate.value,
       })
       const matched = page.items
       sourceSummaries.value = mergeSourceSummaries(sourceSummaries.value, matched)
-      historyHasMore.value = page.has_more
-      historyNextBeforeId.value = page.next_before_id
       historyRuns.value = filterVisibleRuns(matched.map(mapRunSummaryToViewModel))
       if (matched.length > 0 && historyRuns.value.length === 0) {
         errorMessage.value = showFailedRuns.value
@@ -484,54 +474,6 @@ export function useAnalysisRuns(options: {
 
     if (selectedDate.value) {
       await loadHistoryRuns()
-    }
-  }
-
-  async function loadMoreTodayRuns() {
-    if (!todayHasMore.value || todayLoadingMore.value || todayNextBeforeId.value == null) {
-      return
-    }
-
-    todayLoadingMore.value = true
-    try {
-      const page = await options.listRunsPage({
-        limit: 20,
-        beforeId: todayNextBeforeId.value,
-      })
-      sourceSummaries.value = mergeSourceSummaries(sourceSummaries.value, page.items)
-      todayHasMore.value = page.has_more
-      todayNextBeforeId.value = page.next_before_id
-
-      const today = new Date()
-      const todaysSummaries = sourceSummaries.value.filter((item) => isSameDay(item.started_at, today))
-      todaySuccessCount.value = todaysSummaries.filter((run) => run.status === 'completed').length
-      todayFailedCount.value = todaysSummaries.filter((run) => run.status === 'failed').length
-      todayRuns.value = filterVisibleRuns(todaysSummaries.map(mapRunSummaryToViewModel))
-    } finally {
-      todayLoadingMore.value = false
-    }
-  }
-
-  async function loadMoreHistoryRuns() {
-    if (!selectedDate.value || !historyHasMore.value || historyLoadingMore.value || historyNextBeforeId.value == null) {
-      return
-    }
-
-    historyLoadingMore.value = true
-    try {
-      const page = await options.listRunsPage({
-        limit: 20,
-        date: selectedDate.value,
-        beforeId: historyNextBeforeId.value,
-      })
-      sourceSummaries.value = mergeSourceSummaries(sourceSummaries.value, page.items)
-      historyHasMore.value = page.has_more
-      historyNextBeforeId.value = page.next_before_id
-
-      const selectedRuns = sourceSummaries.value.filter((item) => isSameDay(item.started_at, new Date(`${selectedDate.value}T00:00:00`)))
-      historyRuns.value = filterVisibleRuns(selectedRuns.map(mapRunSummaryToViewModel))
-    } finally {
-      historyLoadingMore.value = false
     }
   }
 
@@ -615,16 +557,10 @@ export function useAnalysisRuns(options: {
     errorMessage,
     renderedOutputHtml,
     renderedOutputLoading,
-    todayLoadingMore,
-    historyLoadingMore,
-    todayHasMore,
-    historyHasMore,
     loadInitialRuns,
     selectRun,
     refreshRunDetail,
     loadHistoryRuns,
-    loadMoreTodayRuns,
-    loadMoreHistoryRuns,
     toggleFailedRuns,
   }
 }

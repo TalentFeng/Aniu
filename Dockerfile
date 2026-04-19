@@ -32,6 +32,7 @@ RUN python -m pip install --upgrade pip \
     && pip install -r requirements.txt
 
 COPY backend/app ./app
+COPY backend/skills ./skills
 COPY backend/.env.example ./.env.example
 COPY --from=frontend-build /build/frontend/dist ./static
 

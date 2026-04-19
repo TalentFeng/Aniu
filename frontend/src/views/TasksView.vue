@@ -25,7 +25,7 @@
 
             <div class="runs-container">
               <!-- 今日运行 - 方块网格 -->
-              <div class="run-group" v-if="todayRuns.length || todaySuccessCount || todayFailedCount">
+              <div class="run-group" v-if="todayRuns.length || todaySuccessCount || todayFailedCount || livePlaceholderVisible">
                 <div class="group-label">
                   <span class="label-text">今日</span>
                   <div class="group-label-meta">
@@ -68,11 +68,6 @@
                 <div v-else class="run-grid-empty">
                   今日暂无可展示的运行记录。
                 </div>
-                <div v-if="todayRuns.length && todayHasMore" class="panel-actions">
-                  <button class="button ghost" :class="{ 'is-loading': todayLoadingMore }" @click="loadMoreTodayRuns" :disabled="todayLoadingMore">
-                    加载更多
-                  </button>
-                </div>
               </div>
               <div v-else class="run-grid-empty">
                 今日暂无运行记录。
@@ -111,12 +106,7 @@
                     <div class="run-card-status" :class="statusTone(run.status)"></div>
                   </div>
                 </div>
-                <div v-if="historyRuns.length && historyHasMore" class="panel-actions">
-                  <button class="button ghost" :class="{ 'is-loading': historyLoadingMore }" @click="loadMoreHistoryRuns" :disabled="historyLoadingMore">
-                    加载更多
-                  </button>
-                </div>
-                <div v-else-if="selectedDate" class="run-grid-empty">
+                <div v-if="selectedDate && !historyRuns.length" class="run-grid-empty">
                   该日期没有找到运行记录，请切换日期后重试。
                 </div>
               </div>
@@ -318,10 +308,6 @@ const {
   historyRuns,
   todaySuccessCount,
   todayFailedCount,
-  todayLoadingMore,
-  historyLoadingMore,
-  todayHasMore,
-  historyHasMore,
   selectedDate,
   errorMessage: analysisError,
   renderedOutputHtml,
@@ -330,8 +316,6 @@ const {
   selectRun,
   refreshRunDetail,
   loadHistoryRuns,
-  loadMoreTodayRuns,
-  loadMoreHistoryRuns,
   toggleFailedRuns,
 } = useAnalysisRuns({
   listRunsPage: api.listRunsPage,
