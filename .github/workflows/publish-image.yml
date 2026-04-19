@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/anacondakc/aniu
+  IMAGE_NAME: ghcr.io/TalentFeng/aniu
 
 jobs:
   build-and-push:
