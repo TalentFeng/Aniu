@@ -10,7 +10,7 @@ from app.db.database import init_db
 from app.db.models import StrategySchedule
 from app.services.aniu_service import aniu_service
 from app.services.mx_skill_service import mx_skill_service
-from app.services.llm_service import LLMService, llm_service
+from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
 
 
 def test_execute_run_rejects_unknown_schedule_id(monkeypatch, tmp_path) -> None:
@@ -141,6 +141,8 @@ def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> N
     client_ids: list[int] = []
 
     class FakeResponse:
+        is_error = False
+
         def __enter__(self):
             return self
 
@@ -152,6 +154,9 @@ def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> N
 
         def iter_lines(self):
             return iter(())
+
+        def read(self) -> bytes:
+            return b""
 
     class FakeClient:
         def __enter__(self):
@@ -195,6 +200,139 @@ def test_consume_llm_stream_uses_fresh_http_client_per_request(monkeypatch) -> N
     assert created_timeouts == [5, 7]
     assert len(client_ids) == 2
     assert client_ids[0] != client_ids[1]
+
+
+def test_consume_llm_stream_reads_json_error_body_from_stream(monkeypatch) -> None:
+    service = LLMService()
+
+    class FakeErrorResponse:
+        status_code = 400
+        is_error = True
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return (
+                b'{"error":{"message":"stream_options.include_usage is not supported"}}'
+            )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            return FakeErrorResponse()
+
+    monkeypatch.setattr(service, "_create_http_client", lambda timeout_seconds: FakeClient())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"大模型请求参数错误 \(400\): stream_options.include_usage is not supported",
+    ) as exc_info:
+        service._consume_llm_stream(
+            base_url="https://example.com/v1",
+            api_key="token",
+            payload={"messages": [], "model": "demo"},
+            timeout_seconds=5,
+        )
+
+    assert "Attempted to access streaming response content" not in str(exc_info.value)
+
+
+def test_consume_llm_stream_reads_text_error_body_from_stream(monkeypatch) -> None:
+    service = LLMService()
+
+    class FakeErrorResponse:
+        status_code = 500
+        is_error = True
+        encoding = "utf-8"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"upstream internal error"
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def stream(self, method, url, headers=None, json=None):
+            del method, url, headers, json
+            return FakeErrorResponse()
+
+    monkeypatch.setattr(service, "_create_http_client", lambda timeout_seconds: FakeClient())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"大模型接口返回错误 \(500\): upstream internal error",
+    ):
+        service._consume_llm_stream(
+            base_url="https://example.com/v1",
+            api_key="token",
+            payload={"messages": [], "model": "demo"},
+            timeout_seconds=5,
+        )
+
+
+def test_parse_llm_stream_response_raises_for_error_chunk() -> None:
+    service = LLMService()
+
+    lines = iter(
+        [
+            'data: {"error":{"message":"quota exceeded"}}',
+            "",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="大模型流式响应错误: quota exceeded"):
+        service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
+
+
+def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    def fake_consume_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            raise LLMUpstreamError(
+                "大模型请求参数错误 (400): unsupported stream_options",
+                status_code=400,
+            )
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(service, "_consume_llm_stream", fake_consume_llm_stream)
+
+    result = service._call_llm_stream(
+        base_url="https://example.com/v1",
+        api_key="token",
+        payload={"messages": [], "model": "demo"},
+        timeout_seconds=5,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert len(seen_payloads) == 2
+    assert seen_payloads[0]["stream"] is True
+    assert seen_payloads[0]["stream_options"] == {"include_usage": True}
+    assert seen_payloads[1]["stream"] is True
+    assert "stream_options" not in seen_payloads[1]
 
 
 def test_execute_tool_adds_guidance_for_api_key_error() -> None:

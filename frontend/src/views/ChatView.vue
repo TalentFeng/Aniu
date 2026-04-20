@@ -11,26 +11,31 @@
       <div class="chat-workspace">
         <ChatSessionSidebar
           :sessions="sessions"
+          :persistent-session="persistentSession"
+          :persistent-selected="persistentSelected"
           :current-session-id="currentSessionId"
           :loading="sessionsLoading"
           @select="handleSelect"
+          @select-persistent="handleSelectPersistent"
           @create="handleCreate"
           @delete="handleDelete"
         />
 
         <ChatConversation
-          :session="currentSession"
-          :messages="messages"
+          :session="persistentSelected ? persistentSession : currentSession"
+          :messages="persistentSelected ? persistentMessages : messages"
           v-model="input"
           :pending-attachments="pendingAttachments"
           :sending="sending"
-          :loading="loading"
-          :loading-older-messages="loadingOlderMessages"
-          :has-more-messages="hasMoreMessages"
-          :can-send="canSend"
-          :error-message="errorMessage"
+          :loading="persistentSelected ? persistentLoading : loading"
+          :loading-older-messages="persistentSelected ? persistentLoadingOlder : loadingOlderMessages"
+          :has-more-messages="persistentSelected ? persistentHasMoreMessages : hasMoreMessages"
+          :can-send="persistentSelected ? false : canSend"
+          :error-message="persistentSelected ? persistentErrorMessage : errorMessage"
+          :read-only="persistentSelected"
+          :summary-text="persistentSelected ? (persistentSession?.archived_summary ?? null) : null"
           :ensure-session-ready="ensureSessionReady"
-          :load-older-messages="loadOlderMessages"
+          :load-older-messages="persistentSelected ? loadOlderPersistentMessages : loadOlderMessages"
           @submit="handleSubmit"
           @attach="addAttachment"
           @remove-attachment="removeAttachment"
@@ -48,6 +53,7 @@ import ChatConversation from '@/components/chat/ChatConversation.vue'
 import ChatSessionSidebar from '@/components/chat/ChatSessionSidebar.vue'
 import { useChatSession } from '@/composables/useChatSession'
 import { useChatSessions } from '@/composables/useChatSessions'
+import { usePersistentSession } from '@/composables/usePersistentSession'
 
 const {
   sessions,
@@ -79,7 +85,20 @@ const {
   removeAttachment,
 } = useChatSession()
 
+const {
+  session: persistentSession,
+  messages: persistentMessages,
+  loading: persistentLoading,
+  loadingOlderMessages: persistentLoadingOlder,
+  errorMessage: persistentErrorMessage,
+  hasMoreMessages: persistentHasMoreMessages,
+  loadSession: loadPersistentSession,
+  loadOlderMessages: loadOlderPersistentMessages,
+  clear: clearPersistentSession,
+} = usePersistentSession()
+
 const skipNextSessionLoad = ref(false)
+const persistentSelected = ref(false)
 const DEFAULT_SESSION_TITLE = '\u65b0\u5bf9\u8bdd'
 const DEFAULT_SESSION_TITLES = new Set([DEFAULT_SESSION_TITLE, '\u65b0\u4f1a\u8bdd'])
 
@@ -116,6 +135,9 @@ onMounted(async () => {
 })
 
 watch(currentSessionId, async (sessionId) => {
+  if (persistentSelected.value) {
+    return
+  }
   activeSessionId.value = sessionId
   if (skipNextSessionLoad.value && sessionId !== null) {
     skipNextSessionLoad.value = false
@@ -125,7 +147,14 @@ watch(currentSessionId, async (sessionId) => {
 })
 
 function handleSelect(sessionId: number) {
+  persistentSelected.value = false
   selectSession(sessionId)
+}
+
+async function handleSelectPersistent() {
+  persistentSelected.value = true
+  activeSessionId.value = null
+  await loadPersistentSession()
 }
 
 async function ensureSessionReady(): Promise<number | null> {
@@ -146,6 +175,7 @@ async function ensureSessionReady(): Promise<number | null> {
 }
 
 async function handleCreate() {
+  persistentSelected.value = false
   try {
     const created = await createSession()
     activeSessionId.value = created.id
@@ -186,4 +216,10 @@ async function handleSubmit() {
 function handleUploadError(message: string) {
   errorMessage.value = message
 }
+
+watch(persistentSelected, (selected) => {
+  if (!selected) {
+    clearPersistentSession()
+  }
+})
 </script>

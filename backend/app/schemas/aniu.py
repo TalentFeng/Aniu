@@ -381,6 +381,30 @@ class ChatSessionMessagesPageRead(BaseModel):
     has_more: bool = False
 
 
+class PersistentSessionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    kind: str = "automation"
+    slug: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
+    archived_summary: str | None = None
+    summary_revision: int = 0
+    last_compacted_message_id: int | None = None
+    last_compacted_run_id: int | None = None
+
+
+class PersistentSessionMessagesPageRead(BaseModel):
+    session: PersistentSessionRead
+    messages: list[ChatMessageRead] = Field(default_factory=list)
+    next_before_id: int | None = None
+    has_more: bool = False
+
+
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1)
 

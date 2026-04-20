@@ -102,8 +102,8 @@ def test_schedule_runs_share_single_automation_session(monkeypatch, tmp_path) ->
         assert len(captured_messages) == 2
         assert any(msg["role"] == "user" for msg in captured_messages[0])
         second_history = captured_messages[1]
-        assert any("[自动任务触发]" in str(msg.get("content") or "") for msg in second_history)
-        assert any("[本轮执行摘要]" in str(msg.get("content") or "") for msg in second_history)
+        assert any("时间：" in str(msg.get("content") or "") for msg in second_history)
+        assert any("scheduled decision" in str(msg.get("content") or "") for msg in second_history)
 
         with session_scope() as db:
             sessions = db.query(ChatSession).filter(ChatSession.kind == "automation").all()
@@ -122,22 +122,17 @@ def test_schedule_runs_share_single_automation_session(monkeypatch, tmp_path) ->
     reset_db_state()
 
 
-def test_manual_runs_do_not_read_or_write_automation_session(monkeypatch, tmp_path) -> None:
-    schedule_messages: list[list[dict[str, object]]] = []
-    manual_calls: list[tuple[str, str]] = []
+def test_manual_runs_share_automation_session_with_scheduled_runs(monkeypatch, tmp_path) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
 
     def fake_run_agent_with_messages(*, messages, **kwargs):
         del kwargs
-        schedule_messages.append(messages)
-        return _fake_run_result("scheduled decision")
-
-    def fake_run_agent(settings, client, emit=None):
-        del client, emit
-        manual_calls.append((str(settings.run_type), str(settings.task_prompt)))
+        captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return _fake_run_result("scheduled decision")
         return _fake_run_result("manual decision")
 
     monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
-    monkeypatch.setattr(llm_service, "run_agent", fake_run_agent)
 
     with create_test_client(monkeypatch, tmp_path):
         with session_scope() as db:
@@ -156,12 +151,13 @@ def test_manual_runs_do_not_read_or_write_automation_session(monkeypatch, tmp_pa
         manual_run = aniu_service.execute_run(trigger_source="manual", schedule_id=None)
 
         assert scheduled_run.chat_session_id is not None
-        assert manual_run.chat_session_id is None
-        assert manual_run.prompt_message_id is None
-        assert manual_run.response_message_id is None
-        assert len(schedule_messages) == 1
-        assert len(manual_calls) == 1
-        assert "[自动任务触发]" not in manual_calls[0][1]
+        assert manual_run.chat_session_id == scheduled_run.chat_session_id
+        assert manual_run.prompt_message_id is not None
+        assert manual_run.response_message_id is not None
+        assert len(captured_messages) == 2
+        second_history = captured_messages[1]
+        assert any("来源: 手动触发" in str(msg.get("content") or "") for msg in second_history)
+        assert any("scheduled decision" in str(msg.get("content") or "") for msg in second_history)
 
         with session_scope() as db:
             sessions = db.query(ChatSession).filter(ChatSession.kind == "automation").all()
@@ -173,8 +169,47 @@ def test_manual_runs_do_not_read_or_write_automation_session(monkeypatch, tmp_pa
                 .order_by(ChatMessageRecord.id.asc())
                 .all()
             )
-            assert len(messages) == 2
-            assert all(record.run_id != manual_run.id for record in messages)
+            assert len(messages) == 4
+            assert [item.role for item in messages] == ["user", "assistant", "user", "assistant"]
+            assert any(record.run_id == manual_run.id for record in messages)
+
+    reset_db_state()
+
+
+def test_scheduled_runs_can_read_prior_manual_history(monkeypatch, tmp_path) -> None:
+    captured_messages: list[list[dict[str, object]]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del kwargs
+        captured_messages.append(messages)
+        if len(captured_messages) == 1:
+            return _fake_run_result("manual decision")
+        return _fake_run_result("scheduled decision")
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            schedule = _prepare_schedule(db, name="收盘分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        manual_run = aniu_service.execute_run(trigger_source="manual", schedule_id=None)
+        scheduled_run = aniu_service.execute_run(
+            trigger_source="schedule",
+            schedule_id=schedule_id,
+        )
+
+        assert manual_run.chat_session_id is not None
+        assert scheduled_run.chat_session_id == manual_run.chat_session_id
+        assert len(captured_messages) == 2
+        second_history = captured_messages[1]
+        assert any("来源: 手动触发" in str(msg.get("content") or "") for msg in second_history)
+        assert any("manual decision" in str(msg.get("content") or "") for msg in second_history)
 
     reset_db_state()
 
@@ -220,7 +255,6 @@ def test_schedule_run_failure_persists_failed_assistant_message(monkeypatch, tmp
             assert messages[0].role == "user"
             assert messages[1].role == "assistant"
             assert "执行失败：llm unavailable" in messages[1].content
-            assert "[本轮失败摘要]" in messages[1].content
             assert run.response_message_id == messages[1].id
 
     reset_db_state()

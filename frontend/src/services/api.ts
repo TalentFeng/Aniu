@@ -1,4 +1,4 @@
-import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
+import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
 import {
   LOGIN_NOTICE_STORAGE_KEY,
   LOGIN_REDIRECT_STORAGE_KEY,
@@ -284,15 +284,29 @@ export const api = {
       body: JSON.stringify(payload),
     })
   },
-  runNow(scheduleId?: number) {
-    const suffix = typeof scheduleId === 'number' ? `?schedule_id=${scheduleId}` : ''
+  runNow(scheduleId?: number, runType?: 'analysis' | 'trade') {
+    const params = new URLSearchParams()
+    if (typeof scheduleId === 'number') {
+      params.set('schedule_id', String(scheduleId))
+    }
+    if (runType) {
+      params.set('run_type', runType)
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : ''
     return request<RunDetail>(`${API_PREFIX}/run${suffix}`, {
       method: 'POST',
       timeoutMs: 10 * 60 * 1000,
     })
   },
-  runNowStream(scheduleId?: number) {
-    const suffix = typeof scheduleId === 'number' ? `?schedule_id=${scheduleId}` : ''
+  runNowStream(scheduleId?: number, runType?: 'analysis' | 'trade') {
+    const params = new URLSearchParams()
+    if (typeof scheduleId === 'number') {
+      params.set('schedule_id', String(scheduleId))
+    }
+    if (runType) {
+      params.set('run_type', runType)
+    }
+    const suffix = params.size > 0 ? `?${params.toString()}` : ''
     return request<{ run_id: number }>(`${API_PREFIX}/run-stream${suffix}`, {
       method: 'POST',
     })
@@ -331,6 +345,12 @@ export const api = {
   },
   getRun(runId: number) {
     return request<RunDetail>(`${API_PREFIX}/runs/${runId}`)
+  },
+  deleteRun(runId: number, force = false) {
+    const suffix = force ? '?force=true' : ''
+    return request<void>(`${API_PREFIX}/runs/${runId}${suffix}`, {
+      method: 'DELETE',
+    })
   },
   getRuntimeOverview() {
     return request<RuntimeOverview>(`${API_PREFIX}/runtime-overview`)
@@ -386,6 +406,19 @@ export const api = {
     }
     return request<ChatSessionMessagesPayload>(
       `${API_PREFIX}/chat/sessions/${sessionId}/messages?${params.toString()}`,
+    )
+  },
+  getPersistentSession() {
+    return request<PersistentSession>(`${API_PREFIX}/persistent-session`)
+  },
+  getPersistentSessionMessages(options: ListChatMessagesOptions = {}) {
+    const params = new URLSearchParams()
+    params.set('limit', String(options.limit ?? 50))
+    if (typeof options.beforeId === 'number') {
+      params.set('before_id', String(options.beforeId))
+    }
+    return request<PersistentSessionMessagesPayload>(
+      `${API_PREFIX}/persistent-session/messages?${params.toString()}`,
     )
   },
   async uploadChatAttachment(file: File, sessionId?: number | null): Promise<ChatAttachment> {

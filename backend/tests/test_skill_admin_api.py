@@ -182,7 +182,8 @@ This skill should only appear in the prompt supplement after it is enabled.
         payload = response.json()
         assert payload["id"] == "fancy-skill"
         assert payload["name"] == "Fancy Skill Name"
-        assert payload["location"].endswith("skill_workspace\\skills\\fancy-skill")
+        assert Path(payload["location"]).name == "fancy-skill"
+        assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
         assert payload["enabled"] is False
         assert payload["compatibility_level"] == "needs_attention"
@@ -479,7 +480,8 @@ SkillHub downloaded skill.
         payload = response.json()
         assert payload["id"] == "newsnow-v2"
         assert payload["name"] == "NewsNow V2"
-        assert payload["location"].endswith("skill_workspace\\skills\\newsnow-v2")
+        assert Path(payload["location"]).name == "newsnow-v2"
+        assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
         assert payload["enabled"] is False
         assert payload["clawhub_slug"] == "newsnow-v2"

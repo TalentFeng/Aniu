@@ -29,6 +29,22 @@
     </div>
 
     <div v-else class="chat-session-groups">
+      <section class="chat-session-group persistent-session-group">
+        <h4 class="chat-session-group-title">持久会话</h4>
+        <ul class="chat-session-list">
+          <li
+            class="chat-session-item persistent-session-item"
+            :class="{ 'is-active': persistentSelected }"
+            @click="$emit('selectPersistent')"
+          >
+            <div class="chat-session-item-body">
+              <span class="chat-session-title">持久会话</span>
+              <span class="chat-session-meta">{{ persistentMeta }}</span>
+            </div>
+          </li>
+        </ul>
+      </section>
+
       <section v-for="group in groupedSessions" :key="group.label" class="chat-session-group">
         <h4 class="chat-session-group-title">{{ group.label }}</h4>
         <ul class="chat-session-list">
@@ -63,17 +79,20 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
-import type { ChatSession } from '@/types'
+import type { ChatSession, PersistentSession } from '@/types'
 import { formatChatSessionTime, getBeijingDayDifference } from '@/utils/formatters'
 
 const props = defineProps<{
   sessions: ChatSession[]
+  persistentSession: PersistentSession | null
+  persistentSelected: boolean
   currentSessionId: number | null
   loading: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'select', sessionId: number): void
+  (e: 'selectPersistent'): void
   (e: 'create'): void
   (e: 'delete', sessionId: number): void
 }>()
@@ -99,6 +118,12 @@ function handleDelete(session: ChatSession) {
 function formatTime(value: string | null): string {
   return formatChatSessionTime(value)
 }
+
+const persistentMeta = computed(() => {
+  const session = props.persistentSession
+  if (!session) return '查看自动化持续上下文'
+  return formatTime(session.last_message_at ?? session.updated_at)
+})
 
 interface SessionGroup {
   label: string

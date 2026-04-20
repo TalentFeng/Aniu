@@ -13,7 +13,7 @@ from app.core.config import get_settings
 from app.core import rate_limit as rate_limit_module
 from app.db import database as database_module
 from app.db.database import session_scope
-from app.db.models import StrategyRun
+from app.db.models import ChatMessageRecord, ChatSession, StrategyRun
 from app.main import create_app
 from app.skills import skill_registry
 from app.services.event_bus import event_bus
@@ -192,6 +192,42 @@ def test_run_stream_endpoint_is_rate_limited(monkeypatch, tmp_path) -> None:
         blocked = client.post("/api/aniu/run-stream", headers=headers)
 
     assert blocked.status_code == 429
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_run_stream_endpoint_passes_manual_trade_run_type(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    captured: dict[str, object] = {}
+
+    def fake_start_run_async(**kwargs):
+      captured.update(kwargs)
+      return 99
+
+    monkeypatch.setattr(aniu_service, "start_run_async", fake_start_run_async)
+    monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(trading_calendar_service, "ensure_years", lambda years: None)
+    monkeypatch.setattr(scheduler_service, "start", lambda: None)
+    monkeypatch.setattr(scheduler_service, "stop", lambda: None)
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    rate_limit_module._limiter.reset()
+    app = create_app()
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _auth_headers(client)
+        response = client.post("/api/aniu/run-stream?run_type=trade", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == 99
+    assert captured["trigger_source"] == "manual"
+    assert captured["schedule_id"] is None
+    assert captured["manual_run_type"] == "trade"
 
     database_module._engine = None
     database_module._session_local = None
@@ -775,6 +811,216 @@ def test_runtime_overview_endpoint_returns_aggregated_stats(monkeypatch, tmp_pat
     assert payload["today"]["api_calls"] == 3
     assert payload["today"]["trades"] == 1
     assert payload["today"]["success_rate"] == 50.0
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_removes_run_and_related_messages(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(title="自动化交易会话", kind="automation", slug="automation-default")
+            db.add(session)
+            db.flush()
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="completed",
+                chat_session_id=session.id,
+            )
+            db.add(run)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="u",
+                        run_id=run.id,
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="a",
+                        run_id=run.id,
+                    ),
+                ]
+            )
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}", headers=headers)
+
+        assert response.status_code == 204
+
+        with session_scope() as db:
+            assert db.get(StrategyRun, run_id) is None
+            linked_messages = (
+                db.query(ChatMessageRecord)
+                .filter(ChatMessageRecord.run_id == run_id)
+                .all()
+            )
+            assert linked_messages == []
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_rejects_running_task(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}", headers=headers)
+
+        assert response.status_code == 409
+        assert "不可删除" in response.json()["detail"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_force_deletes_stuck_running_task(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}?force=true", headers=headers)
+
+        assert response.status_code == 204
+
+        with session_scope() as db:
+            assert db.get(StrategyRun, run_id) is None
+
+    assert aniu_service._run_lock.locked() is False
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_force_still_rejects_when_service_is_busy(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        acquired = aniu_service._run_lock.acquire(blocking=False)
+        assert acquired is True
+        try:
+            headers = _auth_headers(client)
+            response = client.delete(f"/api/aniu/runs/{run_id}?force=true", headers=headers)
+        finally:
+            aniu_service._run_lock.release()
+
+        assert response.status_code == 409
+        assert "当前仍有任务正在执行" in response.json()["detail"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_persistent_session_endpoint_returns_summary(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="## 当前策略\n- 继续观察",
+                summary_revision=3,
+            )
+            db.add(session)
+            db.flush()
+            db.add(
+                ChatMessageRecord(
+                    session_id=session.id,
+                    role="assistant",
+                    content="summary",
+                )
+            )
+
+        headers = _auth_headers(client)
+        response = client.get("/api/aniu/persistent-session", headers=headers)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["title"] == "自动化交易会话"
+        assert payload["slug"] == "automation-default"
+        assert payload["message_count"] == 1
+        assert payload["summary_revision"] == 3
+        assert "继续观察" in payload["archived_summary"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_persistent_session_messages_endpoint_returns_messages(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+            )
+            db.add(session)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="first",
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="second",
+                    ),
+                ]
+            )
+
+        headers = _auth_headers(client)
+        response = client.get(
+            "/api/aniu/persistent-session/messages?limit=10",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["session"]["slug"] == "automation-default"
+        assert [item["content"] for item in payload["messages"]] == ["first", "second"]
+        assert payload["has_more"] is False
 
     database_module._engine = None
     database_module._session_local = None

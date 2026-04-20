@@ -10,6 +10,11 @@
       </div>
     </header>
 
+    <div v-if="summaryText" class="chat-session-summary">
+      <div class="chat-session-summary-label">滚动摘要</div>
+      <pre class="chat-session-summary-content">{{ summaryText }}</pre>
+    </div>
+
     <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
 
     <div ref="scrollRef" class="chat-message-list" @scroll="handleScroll">
@@ -31,7 +36,7 @@
         直接输入并发送消息，即可自动开始一个新对话。
       </div>
       <div v-else-if="messages.length === 0" class="empty-state chat-empty-state">
-        开始聊天吧。
+        {{ readOnly ? '当前持久会话暂无消息。' : '开始聊天吧。' }}
       </div>
       <template v-else>
         <ChatMessageItem
@@ -45,6 +50,7 @@
     </div>
 
     <ChatComposer
+      v-if="!readOnly"
       v-model="inputValue"
       :session-id="session?.id ?? null"
       :pending-attachments="pendingAttachments"
@@ -64,11 +70,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import ChatComposer from './ChatComposer.vue'
 import ChatMessageItem from './ChatMessageItem.vue'
-import type { ChatAttachment, ChatMessage, ChatSession } from '@/types'
+import type { ChatAttachment, ChatMessage, ChatSession, PersistentSession } from '@/types'
 import { isChatScrollNearBottom, shouldAutoFollowChatScroll } from '@/utils/chatScrollFollow'
 
 const props = defineProps<{
-  session: ChatSession | null
+  session: ChatSession | PersistentSession | null
   messages: ChatMessage[]
   modelValue: string
   pendingAttachments: ChatAttachment[]
@@ -78,6 +84,8 @@ const props = defineProps<{
   hasMoreMessages: boolean
   canSend: boolean
   errorMessage: string
+  readOnly?: boolean
+  summaryText?: string | null
   ensureSessionReady: () => Promise<number | null>
   loadOlderMessages: () => Promise<void>
 }>()
