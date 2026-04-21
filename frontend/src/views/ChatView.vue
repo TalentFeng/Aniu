@@ -94,6 +94,7 @@ const {
   hasMoreMessages: persistentHasMoreMessages,
   loadSession: loadPersistentSession,
   loadOlderMessages: loadOlderPersistentMessages,
+  refreshSummaryOnly: refreshPersistentSummaryOnly,
   clear: clearPersistentSession,
 } = usePersistentSession()
 
@@ -131,7 +132,10 @@ async function restoreCurrentSession(forceReload = false) {
 }
 
 onMounted(async () => {
-  await restoreCurrentSession(true)
+  await Promise.all([
+    restoreCurrentSession(true),
+    refreshPersistentSummaryOnly(),
+  ])
 })
 
 watch(currentSessionId, async (sessionId) => {

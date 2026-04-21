@@ -1,4 +1,4 @@
-import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
+import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
 import {
   LOGIN_NOTICE_STORAGE_KEY,
   LOGIN_REDIRECT_STORAGE_KEY,
@@ -345,6 +345,11 @@ export const api = {
   },
   getRun(runId: number) {
     return request<RunDetail>(`${API_PREFIX}/runs/${runId}`)
+  },
+  getRunRawToolPreview(runId: number, previewIndex: number) {
+    return request<RawToolPreviewDetail>(
+      `${API_PREFIX}/runs/${runId}/raw-tool-previews/${previewIndex}`,
+    )
   },
   deleteRun(runId: number, force = false) {
     const suffix = force ? '?force=true' : ''

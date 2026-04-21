@@ -61,8 +61,8 @@
               </div>
               <div class="stat-card">
                 <span class="meta-label">累计表现</span>
-                <strong :class="profitClass(account?.holding_profit)">{{ formatSignedMoney(account?.holding_profit) }}</strong>
-                <p>总持仓盈亏</p>
+                <strong :class="profitClass(getAssetDelta(account?.total_assets, account?.initial_capital))">{{ formatSignedMoney(getAssetDelta(account?.total_assets, account?.initial_capital)) }}</strong>
+                <p>总收益金额</p>
                 <div class="stat-card-inline">
                   <span>总收益率</span>
                   <b :class="profitClass(account?.total_return_ratio)">{{ formatPercent(account?.total_return_ratio) }}</b>

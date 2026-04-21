@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 
-import type { ApiDetail, RawToolPreview, RunDetail, RunSummary, RunSummaryPage, TradeDetail, TradeOrder } from '@/types'
+import type { ApiDetail, RawToolPreview, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, TradeDetail, TradeOrder } from '@/types'
 
 export interface AnalysisRunViewModel {
   id: number
@@ -318,6 +318,7 @@ function getLatestRun(runs: AnalysisRunViewModel[]) {
 export function useAnalysisRuns(options: {
   listRunsPage: (options?: { limit?: number, date?: string, status?: string, beforeId?: number }) => Promise<RunSummaryPage>
   loadRunDetail: (runId: number, options?: { force?: boolean }) => Promise<RunDetail>
+  loadRawToolPreview: (runId: number, previewIndex: number) => Promise<RawToolPreviewDetail>
 }) {
   const selectedRun = ref<AnalysisRunViewModel | null>(null)
   const selectedRunLoading = ref(false)
@@ -331,6 +332,7 @@ export function useAnalysisRuns(options: {
   const runCache = new Map<number, AnalysisRunViewModel>()
   const markdownCache = new Map<string, string>()
   const sourceSummaries = ref<RunSummary[]>([])
+  const rawToolPreviewRequests = new Map<string, Promise<RawToolPreviewDetail>>()
 
   let markdownRendererPromise: Promise<((content: string) => string)> | null = null
 
@@ -392,6 +394,63 @@ export function useAnalysisRuns(options: {
       selectedRun.value = detail
     }
     return detail
+  }
+
+  async function ensureRawToolPreview(runId: number, previewIndex: number): Promise<RawToolPreview> {
+    const run = runCache.get(runId)
+    const cachedPreview = run?.rawToolPreviews.find((item) => item.preview_index === previewIndex) ?? null
+    if (cachedPreview && !cachedPreview.truncated) {
+      return cachedPreview
+    }
+
+    const requestKey = `${runId}:${previewIndex}`
+    const pendingRequest = rawToolPreviewRequests.get(requestKey)
+    if (pendingRequest) {
+      const detail = await pendingRequest
+      return applyRawToolPreviewDetail(runId, detail)
+    }
+
+    const request = options.loadRawToolPreview(runId, previewIndex)
+    rawToolPreviewRequests.set(requestKey, request)
+    try {
+      const detail = await request
+      return applyRawToolPreviewDetail(runId, detail)
+    } finally {
+      rawToolPreviewRequests.delete(requestKey)
+    }
+  }
+
+  function applyRawToolPreviewDetail(runId: number, detail: RawToolPreviewDetail): RawToolPreview {
+    const run = runCache.get(runId)
+    const nextPreview: RawToolPreview = {
+      preview_index: detail.preview_index,
+      tool_name: detail.tool_name,
+      display_name: detail.display_name,
+      summary: detail.summary,
+      preview: detail.full_preview,
+      truncated: false,
+    }
+
+    if (!run) {
+      return nextPreview
+    }
+
+    const nextRun: AnalysisRunViewModel = {
+      ...run,
+      rawToolPreviews: run.rawToolPreviews.map((item) => (
+        item.preview_index === detail.preview_index ? nextPreview : item
+      )),
+    }
+    runCache.set(runId, nextRun)
+
+    if (selectedRun.value?.id === runId) {
+      selectedRun.value = nextRun
+    }
+
+    todayRuns.value = todayRuns.value.map((item) => (item.id === runId ? nextRun : item))
+    historyRuns.value = historyRuns.value.map((item) => (item.id === runId ? nextRun : item))
+
+    return nextPreview
   }
 
   async function loadInitialRuns(config: { syncSelection?: boolean } = {}) {
@@ -536,6 +595,7 @@ export function useAnalysisRuns(options: {
     loadInitialRuns,
     selectRun,
     refreshRunDetail,
+    ensureRawToolPreview,
     loadHistoryRuns,
   }
 }

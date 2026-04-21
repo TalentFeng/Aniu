@@ -242,8 +242,7 @@ class SkillRegistry:
                         "## 技能运行时",
                         "以下通用运行时工具始终可用，可作为所有技能的执行底座："
                         + ", ".join(f"`{name}`" for name in runtime_tools),
-                        "没有 Python handler 的技能也属于已支持技能：请先读取技能摘要里给出的 `SKILL.md`，"
-                        "再使用 `read_file` / `glob` / `grep` 读取说明与支持文件，最后配合运行时工具执行。",
+                        "`read_file` 只适用于纯文本文件；不要对 PDF、图片、docx/xlsx/pptx 等二进制附件调用 `read_file`。",
                         "处理大文件或多参考文件时，优先使用 `glob` / `grep` 缩小范围，再读取具体文件。",
                         "所有写入与命令执行仅允许在 skill workspace 内进行；内置技能文档可以读取，但不能修改。",
                     ]

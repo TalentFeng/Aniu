@@ -52,7 +52,6 @@ const props = defineProps<{
 defineEmits<{ (e: 'remove', id: number): void }>()
 
 const isImage = computed(() => props.attachment.mime_type.startsWith('image/'))
-const isPdf = computed(() => props.attachment.mime_type === 'application/pdf')
 
 const previewUrl = ref('')
 const loadingPreview = ref(false)
@@ -93,7 +92,7 @@ async function openAttachment() {
       shouldRevoke = true
     }
 
-    if (isImage.value || isPdf.value) {
+    if (isImage.value) {
       window.open(objectUrl, '_blank', 'noopener,noreferrer')
     } else {
       const link = document.createElement('a')

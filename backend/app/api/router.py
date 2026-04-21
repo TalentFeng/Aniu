@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,7 @@ from app.schemas.aniu import (
     LoginRequest,
     LoginResponse,
     RunDetailRead,
+    RawToolPreviewDetailRead,
     RunSummaryRead,
     RunSummaryPageRead,
     RuntimeOverviewRead,
@@ -326,6 +327,22 @@ def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="运行记录不存在。")
     return run
+
+
+@router.get(
+    "/runs/{run_id}/raw-tool-previews/{preview_index}",
+    response_model=RawToolPreviewDetailRead,
+)
+def get_run_raw_tool_preview(
+    run_id: int,
+    preview_index: int = Path(ge=0),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> RawToolPreviewDetailRead:
+    try:
+        return aniu_service.get_run_raw_tool_preview(db, run_id, preview_index)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.delete("/runs/{run_id}", status_code=204)

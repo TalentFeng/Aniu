@@ -72,6 +72,11 @@ export interface RawToolPreview {
   display_name: string
   summary: string
   preview: string
+  truncated: boolean
+}
+
+export interface RawToolPreviewDetail extends RawToolPreview {
+  full_preview: string
 }
 
 export interface TradeDetail {

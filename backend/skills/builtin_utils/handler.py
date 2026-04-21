@@ -106,8 +106,19 @@ def _builtin_skills_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _chat_uploads_root() -> Path:
+    try:
+        from app.core.config import get_runtime_data_dir, get_settings
+
+        root = get_runtime_data_dir(get_settings()) / "chat_uploads"
+    except Exception:
+        root = Path.cwd() / "data" / "chat_uploads"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
 def _read_roots() -> list[Path]:
-    return [_workspace_root(), _builtin_skills_root().resolve()]
+    return [_workspace_root(), _builtin_skills_root().resolve(), _chat_uploads_root()]
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -345,7 +356,7 @@ _TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file with line numbers. Supports absolute paths inside readable skill roots.",
+            "description": "Read a plain text file with line numbers. Do not use for PDFs, images, Office files, or other binary documents.",
             "parameters": {
                 "type": "object",
                 "properties": {

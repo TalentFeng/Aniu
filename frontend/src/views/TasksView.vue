@@ -243,16 +243,16 @@
                   >
                     {{ liveOutputText }}
                   </div>
-                  <div
-                    v-else-if="liveVisible"
-                    ref="liveOutputRef"
-                    class="markdown-content live-markdown-content"
-                    @scroll="handleLiveOutputScroll"
-                    v-html="liveOutputHtml"
-                  ></div>
-                  <div v-else-if="activePreview" class="raw-output-content">
-                    {{ activePreview.preview }}
-                  </div>
+                   <div
+                     v-else-if="liveVisible"
+                     ref="liveOutputRef"
+                     class="markdown-content live-markdown-content"
+                     @scroll="handleLiveOutputScroll"
+                     v-html="liveOutputHtml"
+                   ></div>
+                   <div v-else-if="activePreview" class="raw-output-content" :class="{ 'is-loading': activePreviewLoading }">
+                     {{ activePreviewText }}
+                   </div>
                  <div v-else-if="renderedOutputLoading" class="detail-empty-state">
                    正在渲染分析输出...
                  </div>
@@ -320,10 +320,12 @@ const {
   loadInitialRuns,
   selectRun,
   refreshRunDetail,
+  ensureRawToolPreview,
   loadHistoryRuns,
 } = useAnalysisRuns({
   listRunsPage: api.listRunsPage,
   loadRunDetail: store.loadRunDetail,
+  loadRawToolPreview: api.getRunRawToolPreview,
 })
 
 onMounted(() => {
@@ -536,6 +538,8 @@ onBeforeUnmount(() => {
 
 const historyDateInput = ref<HTMLInputElement | null>(null)
 const activePreviewIndex = ref<number | null>(null)
+const activePreviewLoading = ref(false)
+const activePreviewError = ref('')
 const apiListRef = ref<HTMLElement | null>(null)
 const tradeListRef = ref<HTMLElement | null>(null)
 const liveOutputRef = ref<HTMLElement | null>(null)
@@ -694,6 +698,16 @@ const activePreview = computed(() => {
   return selectedRun.value.rawToolPreviews.find((item) => item.preview_index === activePreviewIndex.value) ?? null
 })
 
+const activePreviewText = computed(() => {
+  if (activePreviewError.value) {
+    return activePreviewError.value
+  }
+  if (activePreviewLoading.value && activePreview.value?.truncated) {
+    return '正在加载完整原文...'
+  }
+  return activePreview.value?.preview ?? ''
+})
+
 const historyDateDisplay = computed(() => {
   if (!selectedDate.value) {
     return '年/月/日'
@@ -731,15 +745,49 @@ function handleSelectRun(runId: number, runs: typeof todayRuns.value) {
   void selectRun(target, { force: target.id === liveRunId.value })
 }
 
-function focusPreview(index: number | null) {
+async function focusPreview(index: number | null) {
   if (typeof index !== 'number') {
     return
   }
-  activePreviewIndex.value = activePreviewIndex.value === index ? null : index
+
+  if (activePreviewIndex.value === index) {
+    clearPreviewFocus()
+    return
+  }
+
+  activePreviewIndex.value = index
+  activePreviewError.value = ''
+
+  const runId = selectedRun.value?.id
+  if (typeof runId !== 'number') {
+    return
+  }
+
+  const preview = selectedRun.value?.rawToolPreviews.find((item) => item.preview_index === index)
+  if (!preview || !preview.truncated) {
+    activePreviewLoading.value = false
+    return
+  }
+
+  activePreviewLoading.value = true
+  try {
+    await ensureRawToolPreview(runId, index)
+  } catch (error) {
+    console.error('[TasksView] raw preview load failed', error)
+    if (activePreviewIndex.value === index) {
+      activePreviewError.value = (error as Error).message || '完整原文加载失败'
+    }
+  } finally {
+    if (activePreviewIndex.value === index) {
+      activePreviewLoading.value = false
+    }
+  }
 }
 
 function clearPreviewFocus() {
   activePreviewIndex.value = null
+  activePreviewLoading.value = false
+  activePreviewError.value = ''
 }
 
 function isNearBottom(element: HTMLElement) {
@@ -857,7 +905,7 @@ function handleKeydown(event: KeyboardEvent) {
 watch(
   () => selectedRun.value?.id,
   () => {
-    activePreviewIndex.value = null
+    clearPreviewFocus()
   },
   { immediate: true },
 )

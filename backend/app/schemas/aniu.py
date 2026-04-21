@@ -136,6 +136,11 @@ class RawToolPreviewRead(BaseModel):
     display_name: str
     summary: str
     preview: str
+    truncated: bool = False
+
+
+class RawToolPreviewDetailRead(RawToolPreviewRead):
+    full_preview: str
 
 
 class TradeDetailRead(BaseModel):
@@ -338,8 +343,14 @@ class ChatResponse(BaseModel):
 
 class ChatStreamRequest(BaseModel):
     session_id: int = Field(ge=1)
-    content: str = Field(min_length=1, max_length=50000)
+    content: str = Field(default="", max_length=50000)
     attachment_ids: list[int] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_non_empty_message(self) -> "ChatStreamRequest":
+        if self.content.strip() or self.attachment_ids:
+            return self
+        raise ValueError("content 和 attachment_ids 至少要提供一项。")
 
 
 class ChatSessionRead(BaseModel):

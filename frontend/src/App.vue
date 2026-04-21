@@ -5,7 +5,10 @@
         <img class="app-brand-logo" src="/aniu.ico" alt="Aniu logo" />
         <div class="app-brand-copy">
           <strong>Aniu</strong>
-          <span>AI模拟交易</span>
+          <span>
+            AI模拟交易
+            <small class="app-version">v{{ appVersion }}</small>
+          </span>
         </div>
       </div>
 
@@ -56,6 +59,7 @@
 import { computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
+import appPackage from '../package.json'
 import { appNavigation } from '@/config/navigation'
 import { useAppStore } from '@/stores/legacy'
 import {
@@ -69,6 +73,7 @@ const store = useAppStore()
 const router = useRouter()
 const route = useRoute()
 const { errorMessage } = storeToRefs(store)
+const appVersion = appPackage.version
 
 const isLoginPage = computed(() => route.path === '/login')
 

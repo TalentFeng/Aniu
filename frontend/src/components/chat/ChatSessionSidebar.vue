@@ -23,12 +23,9 @@
       </div>
     </div>
 
-    <div v-if="loading && !sessions.length" class="chat-session-empty">加载中…</div>
-    <div v-else-if="!groupedSessions.length" class="chat-session-empty">
-      点击左侧 + 号新建对话
-    </div>
+    <div v-if="loading && !sessions.length && !persistentSession" class="chat-session-empty">加载中…</div>
 
-    <div v-else class="chat-session-groups">
+    <div class="chat-session-groups">
       <section class="chat-session-group persistent-session-group">
         <h4 class="chat-session-group-title">持久会话</h4>
         <ul class="chat-session-list">
@@ -44,6 +41,10 @@
           </li>
         </ul>
       </section>
+
+      <div v-if="!groupedSessions.length" class="chat-session-empty">
+        点击左侧 + 号新建对话
+      </div>
 
       <section v-for="group in groupedSessions" :key="group.label" class="chat-session-group">
         <h4 class="chat-session-group-title">{{ group.label }}</h4>

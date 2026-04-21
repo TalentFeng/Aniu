@@ -42,6 +42,8 @@ from app.services.trading_calendar_service import trading_calendar_service
 
 logger = logging.getLogger(__name__)
 
+RAW_TOOL_PREVIEW_MAX_CHARS = 6000
+
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析"}
 SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
@@ -497,6 +499,18 @@ class AniuService:
             self._hydrate_run_datetimes(run, include_display_fields=True)
         return run
 
+    def get_run_raw_tool_preview(
+        self, db: Session, run_id: int, preview_index: int
+    ) -> dict[str, Any]:
+        run = self.get_run(db, run_id)
+        if run is None:
+            raise LookupError("运行记录不存在。")
+
+        preview = self._build_raw_tool_preview_by_index(run, preview_index)
+        if preview is None:
+            raise LookupError("原始工具预览不存在。")
+        return preview
+
     def get_persistent_session(self, db: Session) -> PersistentSessionRead:
         session = self._get_or_create_persistent_session(db)
         total_count = db.execute(
@@ -779,34 +793,63 @@ class AniuService:
             )
         return results
 
-    def _build_raw_tool_previews(self, run: StrategyRun) -> list[dict[str, str]]:
-        previews: list[dict[str, str]] = []
+    def _build_raw_tool_previews(self, run: StrategyRun) -> list[dict[str, Any]]:
+        previews: list[dict[str, Any]] = []
         for idx, item in enumerate(self._get_detail_tool_calls(run)):
-            tool_name = str(item.get("name") or "")
-            tool_text = self._get_api_tool_text(tool_name)
-            result = item.get("result")
-            if not isinstance(result, dict):
-                continue
-            raw_payload = result.get("result")
-            preview_source = raw_payload if raw_payload is not None else result
-            previews.append(
-                {
-                    "preview_index": idx,
-                    "tool_name": tool_name,
-                    "display_name": tool_text["name"],
-                    "summary": str(result.get("summary") or tool_text["summary"]),
-                    "preview": self._format_tool_preview(preview_source),
-                }
-            )
+            preview = self._build_raw_tool_preview_item(item, idx)
+            if preview is not None:
+                previews.append(preview)
         return previews
 
-    def _format_tool_preview(self, payload: Any, max_chars: int = 6000) -> str:
+    def _build_raw_tool_preview_by_index(
+        self, run: StrategyRun, preview_index: int
+    ) -> dict[str, Any] | None:
+        for idx, item in enumerate(self._get_detail_tool_calls(run)):
+            if idx != preview_index:
+                continue
+            return self._build_raw_tool_preview_item(item, idx, truncate=False)
+        return None
+
+    def _build_raw_tool_preview_item(
+        self,
+        item: dict[str, Any],
+        preview_index: int,
+        *,
+        truncate: bool = True,
+    ) -> dict[str, Any] | None:
+        tool_name = str(item.get("name") or "")
+        tool_text = self._get_api_tool_text(tool_name)
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return None
+        raw_payload = result.get("result")
+        preview_source = raw_payload if raw_payload is not None else result
+        full_preview = self._format_tool_preview(preview_source, truncate=False)
+        truncated = len(full_preview) > RAW_TOOL_PREVIEW_MAX_CHARS
+        preview = self._format_tool_preview(preview_source) if truncate else full_preview
+        return {
+            "preview_index": preview_index,
+            "tool_name": tool_name,
+            "display_name": tool_text["name"],
+            "summary": str(result.get("summary") or tool_text["summary"]),
+            "preview": preview,
+            "truncated": truncated if truncate else False,
+            "full_preview": full_preview,
+        }
+
+    def _format_tool_preview(
+        self,
+        payload: Any,
+        max_chars: int = RAW_TOOL_PREVIEW_MAX_CHARS,
+        *,
+        truncate: bool = True,
+    ) -> str:
         try:
             text = json.dumps(payload, ensure_ascii=False, indent=2)
         except (TypeError, ValueError):
             text = str(payload)
         text = text.strip()
-        if len(text) <= max_chars:
+        if not truncate or len(text) <= max_chars:
             return text
         return text[: max_chars - 16].rstrip() + "\n...\n<已截断>"
 
@@ -2290,8 +2333,6 @@ class AniuService:
     ) -> PersistentRunSessionContext:
         with session_scope() as db:
             session = self._get_or_create_persistent_session(db)
-            previous_last_message_at = _assume_utc(session.last_message_at)
-            archived_summary = session.archived_summary
             user_content = self._build_persistent_session_user_content(
                 settings=settings,
                 trigger_source=trigger_source,
@@ -2322,15 +2363,9 @@ class AniuService:
             history_messages = self._build_persistent_session_history_messages(
                 history_records
             )
-            resume_block = self._build_persistent_session_resume_block(
-                idle_since=previous_last_message_at,
-                archived_summary=archived_summary,
-                settings=settings,
-            )
             messages = self._build_persistent_session_prompt_messages(
                 session=session,
                 history_messages=history_messages,
-                resume_block=resume_block,
                 memory_messages=self._retrieve_persistent_session_memory_messages(
                     session=session,
                     settings=settings,
@@ -2342,7 +2377,6 @@ class AniuService:
                 session=session,
                 settings=settings,
                 messages=messages,
-                resume_block=resume_block,
             )
             context_tokens_estimate = max(
                 context_tokens_estimate,
@@ -2448,27 +2482,6 @@ class AniuService:
         del settings, schedule_name, prefetched_context
         return "\n".join(lines).strip()
 
-    def _summarize_tool_calls(
-        self, tool_calls: list[dict[str, Any]] | None, *, limit: int = 8
-    ) -> list[str]:
-        if not isinstance(tool_calls, list):
-            return []
-        lines: list[str] = []
-        for item in tool_calls[:limit]:
-            if not isinstance(item, dict):
-                continue
-            tool_name = str(item.get("name") or item.get("tool_name") or "").strip()
-            if not tool_name:
-                continue
-            result = item.get("result")
-            summary = ""
-            if isinstance(result, dict):
-                summary = str(result.get("summary") or result.get("error") or "").strip()
-            if not summary:
-                summary = str(item.get("summary") or "已执行").strip() or "已执行"
-            lines.append(f"- {tool_name}: {summary}")
-        return lines
-
     def _build_persistent_session_assistant_content(
         self,
         *,
@@ -2482,14 +2495,12 @@ class AniuService:
         phase: str | None = None,
     ) -> str:
         content = str(final_answer or "").strip()
-        actions = executed_actions if isinstance(executed_actions, list) else []
-        tool_lines = self._summarize_tool_calls(tool_calls)
 
         if status == "completed":
-            del actions, tool_lines, run_id, run_type
+            del executed_actions, tool_calls, run_id, run_type
             return content or "本轮已完成，但未生成额外说明。"
 
-        del actions, tool_lines, run_id, run_type, phase
+        del executed_actions, tool_calls, run_id, run_type, phase
         return f"执行失败：{str(error_message or '未知错误').strip() or '未知错误'}"
 
     def _persist_persistent_session_user_message(
@@ -2611,11 +2622,7 @@ class AniuService:
         for record in records:
             if record.role not in {"user", "assistant", "system"}:
                 continue
-            content_parts = [str(record.content or "").strip()]
-            tool_lines = self._summarize_tool_calls(record.tool_calls)
-            if tool_lines:
-                content_parts.append("[历史工具摘要]\n" + "\n".join(tool_lines))
-            content = "\n\n".join(part for part in content_parts if part).strip()
+            content = str(record.content or "").strip()
             if not content:
                 continue
             messages.append({"role": record.role, "content": content})
@@ -2640,69 +2647,32 @@ class AniuService:
         session: ChatSession,
         settings: Any,
         messages: list[dict[str, Any]],
-        resume_block: str | None,
     ) -> int:
         estimate = estimate_messages_tokens(messages)
         estimate += estimate_text_tokens(getattr(settings, "system_prompt", None))
         estimate += estimate_text_tokens(session.archived_summary)
-        estimate += estimate_text_tokens(resume_block)
         return estimate
-
-    def _build_persistent_session_resume_block(
-        self,
-        *,
-        idle_since: datetime | None,
-        archived_summary: str | None,
-        settings: Any,
-    ) -> str | None:
-        archived_summary = str(archived_summary or "").strip()
-        if not archived_summary:
-            return None
-        last_message_at = _assume_utc(idle_since)
-        if last_message_at is None:
-            return None
-        idle_hours = int(
-            getattr(settings, "automation_idle_summary_hours", 0)
-            or AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS
-        )
-        if idle_hours <= 0:
-            return None
-        elapsed = now_utc() - last_message_at
-        if elapsed < timedelta(hours=idle_hours):
-            return None
-        return (
-            f"[恢复摘要]\n该自动化会话已空闲 {int(elapsed.total_seconds() // 3600)} 小时。\n"
-            f"以下是上次压缩后的状态摘要：\n{archived_summary}"
-        )
 
     def _build_persistent_session_context_system_message(
         self,
         *,
         session: ChatSession,
-        resume_block: str | None,
     ) -> dict[str, Any] | None:
-        parts: list[str] = []
         archived_summary = str(session.archived_summary or "").strip()
-        if archived_summary:
-            parts.append("[滚动摘要]\n" + archived_summary)
-        if resume_block:
-            parts.append(resume_block)
-        if not parts:
+        if not archived_summary:
             return None
-        return {"role": "system", "content": "\n\n".join(parts)}
+        return {"role": "system", "content": "[上下文压缩摘要]\n" + archived_summary}
 
     def _build_persistent_session_prompt_messages(
         self,
         *,
         session: ChatSession,
         history_messages: list[dict[str, Any]],
-        resume_block: str | None,
         memory_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         context_message = self._build_persistent_session_context_system_message(
             session=session,
-            resume_block=resume_block,
         )
         if context_message is not None:
             messages.append(context_message)
