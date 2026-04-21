@@ -24,9 +24,103 @@ class LLMStreamCancelled(RuntimeError):
     """Raised when a streaming chat/run should stop because the client disconnected."""
 
 
+class LLMUpstreamError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise LLMStreamCancelled("客户端连接已断开。")
+
+
+def _format_error_message(prefix: str, detail: str) -> str:
+    detail_text = str(detail or "").strip()
+    if detail_text:
+        return f"{prefix}: {detail_text}"
+    return f"{prefix}。"
+
+
+def _extract_error_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            part = _extract_error_text(item)
+            if part:
+                parts.append(part)
+        return "; ".join(parts)
+    if isinstance(value, dict):
+        for key in ("message", "detail", "msg", "error_description", "reason"):
+            part = _extract_error_text(value.get(key))
+            if part:
+                return part
+        return _safe_json_dumps(value)
+    return str(value).strip()
+
+
+def _extract_error_detail(payload: Any) -> str:
+    if isinstance(payload, dict):
+        detail = _extract_error_text(payload.get("error"))
+        if detail:
+            return detail
+        for key in ("message", "detail", "msg", "error_description"):
+            detail = _extract_error_text(payload.get(key))
+            if detail:
+                return detail
+    return _extract_error_text(payload)
+
+
+def _decode_response_body(response: httpx.Response, raw_body: bytes) -> str:
+    if not raw_body:
+        return ""
+    encoding = response.encoding or "utf-8"
+    try:
+        return raw_body.decode(encoding, errors="replace").strip()
+    except LookupError:
+        return raw_body.decode("utf-8", errors="replace").strip()
+
+
+def _extract_response_error_detail(response: httpx.Response, raw_body: bytes) -> str:
+    body_text = _decode_response_body(response, raw_body)
+    if not body_text:
+        return ""
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError:
+        return body_text[:500]
+    detail = _extract_error_detail(payload)
+    return (detail or body_text)[:500]
+
+
+def _raise_upstream_http_error(response: httpx.Response, raw_body: bytes) -> None:
+    status = int(response.status_code)
+    detail = _extract_response_error_detail(response, raw_body)
+    if status == 401:
+        raise LLMUpstreamError(
+            _format_error_message("大模型 API Key 无效或已过期 (401)", detail),
+            status_code=status,
+        )
+    if status == 400:
+        raise LLMUpstreamError(
+            _format_error_message("大模型请求参数错误 (400)", detail),
+            status_code=status,
+        )
+    if status == 429:
+        raise LLMUpstreamError(
+            _format_error_message("大模型接口请求频率超限 (429)", detail),
+            status_code=status,
+        )
+    raise LLMUpstreamError(
+        _format_error_message(f"大模型接口返回错误 ({status})", detail),
+        status_code=status,
+    )
 
 
 def _to_text_content(value: Any) -> str:
@@ -192,6 +286,29 @@ class LLMService:
             "tool_choice": "auto",
         }
 
+    def build_request_payload_from_messages(
+        self,
+        *,
+        app_settings: Any,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        run_type = str(getattr(app_settings, "run_type", "analysis") or "analysis")
+        system_prompt = self._augment_system_prompt(
+            app_settings.system_prompt,
+            run_type=run_type,
+        )
+        payload_messages: list[dict[str, Any]] = []
+        if system_prompt:
+            payload_messages.append({"role": "system", "content": system_prompt})
+        payload_messages.extend(dict(message) for message in messages)
+        return {
+            "model": app_settings.llm_model,
+            "temperature": _LLM_TEMPERATURE,
+            "messages": payload_messages,
+            "tools": skill_registry.build_tools(run_type=run_type),
+            "tool_choice": "auto",
+        }
+
     @staticmethod
     def _augment_system_prompt(
         base_prompt: str | None,
@@ -213,7 +330,30 @@ class LLMService:
         client: MXClient,
         emit: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-        request_payload = self.build_initial_request_payload(app_settings)
+        return self.run_agent_with_messages(
+            app_settings=app_settings,
+            client=client,
+            messages=[
+                {
+                    "role": "user",
+                    "content": getattr(app_settings, "task_prompt", ""),
+                }
+            ],
+            emit=emit,
+        )
+
+    def run_agent_with_messages(
+        self,
+        *,
+        app_settings: Any,
+        client: MXClient,
+        messages: list[dict[str, Any]],
+        emit: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        request_payload = self.build_request_payload_from_messages(
+            app_settings=app_settings,
+            messages=messages,
+        )
         if not app_settings.llm_base_url or not app_settings.llm_api_key:
             raise RuntimeError("未配置大模型接口，无法执行 AI 调度。")
 
@@ -404,7 +544,7 @@ class LLMService:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
 
-        last_error: RuntimeError | None = None
+        last_error: LLMUpstreamError | None = None
         for include_usage in (True, False):
             _raise_if_cancelled(cancel_event)
             attempt_payload = dict(stream_payload)
@@ -419,9 +559,9 @@ class LLMService:
                     emit=emit,
                     cancel_event=cancel_event,
                 )
-            except RuntimeError as exc:
+            except LLMUpstreamError as exc:
                 last_error = exc
-                if not include_usage or "参数错误 (400)" not in str(exc):
+                if not include_usage or exc.status_code != 400:
                     raise
 
         if last_error is not None:
@@ -457,36 +597,21 @@ class LLMService:
                     headers=headers,
                     json=payload,
                 ) as response:
-                    response.raise_for_status()
+                    if response.is_error:
+                        _raise_upstream_http_error(response, response.read())
                     return self._parse_llm_stream_response(
                         lines=response.iter_lines(),
                         emit=_emit,
                         cancel_event=cancel_event,
                     )
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status == 401:
-                raise RuntimeError("大模型 API Key 无效或已过期 (401)。") from exc
-            if status == 400:
-                detail = ""
-                try:
-                    detail = exc.response.json().get("error", {}).get("message", "")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"大模型请求参数错误 (400): {detail or exc.response.text[:200]}"
-                ) from exc
-            if status == 429:
-                raise RuntimeError(
-                    "大模型接口请求频率超限 (429)，请稍后重试。"
-                ) from exc
-            raise RuntimeError(
-                f"大模型接口返回错误 ({status}): {exc.response.text[:200]}"
-            ) from exc
+        except LLMUpstreamError:
+            raise
         except httpx.TimeoutException as exc:
             raise RuntimeError(
                 f"大模型接口请求超时 ({timeout_seconds}s)，请检查网络或增加超时时间。"
             ) from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"大模型接口请求失败: {exc}") from exc
 
     def _parse_llm_stream_response(
         self,
@@ -526,6 +651,24 @@ class LLMService:
 
             chunk = json.loads(raw_payload)
             chunk_count += 1
+
+            if "error" in chunk:
+                raise LLMUpstreamError(
+                    _format_error_message(
+                        "大模型流式响应错误",
+                        _extract_error_detail(chunk),
+                    )
+                )
+
+            if any(key in chunk for key in ("message", "detail")) and not chunk.get(
+                "choices"
+            ):
+                raise LLMUpstreamError(
+                    _format_error_message(
+                        "大模型流式响应错误",
+                        _extract_error_detail(chunk),
+                    )
+                )
 
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]

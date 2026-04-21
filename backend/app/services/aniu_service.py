@@ -7,6 +7,7 @@ import queue
 import secrets
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
@@ -14,23 +15,34 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import create_access_token
 from app.core.config import get_settings
 from app.core.constants import DEFAULT_SYSTEM_PROMPT
 from app.db.database import session_scope
-from app.db.models import AppSettings, StrategyRun, StrategySchedule, TradeOrder
+from app.db.models import (
+    AppSettings,
+    ChatMessageRecord,
+    ChatSession,
+    StrategyRun,
+    StrategySchedule,
+    TradeOrder,
+)
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
+from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.services.event_bus import event_bus, make_emitter
 from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.mx_skill_service import mx_skill_service
 from app.services.mx_service import MXClient
+from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
 
 
 logger = logging.getLogger(__name__)
+
+RAW_TOOL_PREVIEW_MAX_CHARS = 6000
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析"}
@@ -42,6 +54,24 @@ ACCOUNT_PREFETCH_TOOL_NAMES = (
     "mx_get_orders",
 )
 ACCOUNT_OVERVIEW_CACHE_MAX_WORKERS = 3
+AUTOMATION_SESSION_SLUG = "automation-default"
+AUTOMATION_SESSION_TITLE = "自动化交易会话"
+AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 65536
+AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS = 24000
+AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT = 24
+AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS = 12
+AUTOMATION_RESERVED_OUTPUT_TOKENS = 4000
+AUTOMATION_SAFETY_BUFFER_TOKENS = 2000
+
+
+@dataclass
+class PersistentRunSessionContext:
+    session_id: int
+    prompt_message_id: int
+    response_message_id: int | None
+    summary_revision: int | None
+    context_tokens_estimate: int | None
+    messages: list[dict[str, Any]]
 
 
 def now_utc() -> datetime:
@@ -178,6 +208,29 @@ class AniuService:
         if name.startswith("上午运行") or name.startswith("下午运行"):
             return "trade"
         return "analysis"
+
+    def _resolve_manual_run_profile(
+        self,
+        *,
+        settings: AppSettings | Any,
+        manual_run_type: str | None,
+    ) -> tuple[str, str]:
+        normalized = str(manual_run_type or "").strip().lower()
+        if normalized == "trade":
+            return (
+                "trade",
+                "请根据当前市场、持仓和资金情况生成交易决策。"
+                "必要时调用妙想工具获取数据，并在满足条件时执行模拟交易。"
+                "最后用自然语言总结本次交易判断、依据和操作结果。",
+            )
+        task_prompt = str(getattr(settings, "task_prompt", "") or "").strip()
+        if task_prompt:
+            return ("analysis", task_prompt)
+        return (
+            "analysis",
+            "请先分析当前情况，必要时自行调用妙想工具获取数据，并在需要时执行模拟交易。"
+            "最后用自然语言总结本次判断、依据和操作结果。",
+        )
 
     def _run_agent_supports_emit(self, run_agent: Any) -> bool:
         try:
@@ -446,6 +499,133 @@ class AniuService:
             self._hydrate_run_datetimes(run, include_display_fields=True)
         return run
 
+    def get_run_raw_tool_preview(
+        self, db: Session, run_id: int, preview_index: int
+    ) -> dict[str, Any]:
+        run = self.get_run(db, run_id)
+        if run is None:
+            raise LookupError("运行记录不存在。")
+
+        preview = self._build_raw_tool_preview_by_index(run, preview_index)
+        if preview is None:
+            raise LookupError("原始工具预览不存在。")
+        return preview
+
+    def get_persistent_session(self, db: Session) -> PersistentSessionRead:
+        session = self._get_or_create_persistent_session(db)
+        total_count = db.execute(
+            select(func.count(ChatMessageRecord.id)).where(
+                ChatMessageRecord.session_id == session.id
+            )
+        ).scalar_one()
+        return PersistentSessionRead(
+            id=session.id,
+            title=session.title,
+            kind=str(session.kind or "automation"),
+            slug=session.slug,
+            created_at=_assume_utc(session.created_at),
+            updated_at=_assume_utc(session.updated_at),
+            last_message_at=_assume_utc(session.last_message_at),
+            message_count=int(total_count),
+            archived_summary=session.archived_summary,
+            summary_revision=int(session.summary_revision or 0),
+            last_compacted_message_id=session.last_compacted_message_id,
+            last_compacted_run_id=session.last_compacted_run_id,
+        )
+
+    def list_persistent_session_messages(
+        self,
+        db: Session,
+        *,
+        limit: int = 50,
+        before_id: int | None = None,
+    ) -> tuple[PersistentSessionRead, list[ChatMessageRead], int | None, bool]:
+        session = self._get_or_create_persistent_session(db)
+        page_size = max(1, int(limit))
+        total_count = db.execute(
+            select(func.count(ChatMessageRecord.id)).where(
+                ChatMessageRecord.session_id == session.id
+            )
+        ).scalar_one()
+
+        stmt = (
+            select(ChatMessageRecord)
+            .where(ChatMessageRecord.session_id == session.id)
+            .order_by(ChatMessageRecord.id.desc())
+        )
+        if before_id is not None:
+            stmt = stmt.where(ChatMessageRecord.id < before_id)
+
+        records = (
+            db.execute(stmt.limit(page_size + 1)).scalars().all()
+        )
+        has_more = len(records) > page_size
+        if has_more:
+            records = records[:page_size]
+        records.reverse()
+        next_before_id = records[0].id if has_more and records else None
+
+        session_read = PersistentSessionRead(
+            id=session.id,
+            title=session.title,
+            kind=str(session.kind or "automation"),
+            slug=session.slug,
+            created_at=_assume_utc(session.created_at),
+            updated_at=_assume_utc(session.updated_at),
+            last_message_at=_assume_utc(session.last_message_at),
+            message_count=int(total_count),
+            archived_summary=session.archived_summary,
+            summary_revision=int(session.summary_revision or 0),
+            last_compacted_message_id=session.last_compacted_message_id,
+            last_compacted_run_id=session.last_compacted_run_id,
+        )
+        return (
+            session_read,
+            [
+                ChatMessageRead(
+                    id=record.id,
+                    role=record.role,
+                    content=record.content,
+                    tool_calls=record.tool_calls,
+                    attachments=None,
+                    created_at=_assume_utc(record.created_at),
+                )
+                for record in records
+            ],
+            next_before_id,
+            has_more,
+        )
+
+    def delete_run(self, db: Session, run_id: int, *, force: bool = False) -> None:
+        run = db.get(StrategyRun, run_id)
+        if run is None:
+            raise LookupError("运行记录不存在。")
+        if str(run.status or "").strip().lower() in {"running", "pending"}:
+            if not force:
+                raise RuntimeError("运行中的任务不可删除，请等待任务结束后重试。")
+            if self._run_lock.locked():
+                raise RuntimeError("当前仍有任务正在执行，暂不能强制删除，请稍后重试。")
+
+        related_session_id = run.chat_session_id
+        db.execute(delete(ChatMessageRecord).where(ChatMessageRecord.run_id == run_id))
+        db.delete(run)
+
+        if related_session_id is not None:
+            session = db.get(ChatSession, related_session_id)
+            if session is not None:
+                last_message = db.scalar(
+                    select(ChatMessageRecord)
+                    .where(ChatMessageRecord.session_id == related_session_id)
+                    .order_by(ChatMessageRecord.id.desc())
+                    .limit(1)
+                )
+                session.last_message_at = (
+                    _assume_utc(last_message.created_at) if last_message is not None else None
+                )
+                db.add(session)
+
+        db.commit()
+
     def _hydrate_run_datetimes(
         self, run: StrategyRun, *, include_display_fields: bool
     ) -> None:
@@ -613,34 +793,63 @@ class AniuService:
             )
         return results
 
-    def _build_raw_tool_previews(self, run: StrategyRun) -> list[dict[str, str]]:
-        previews: list[dict[str, str]] = []
+    def _build_raw_tool_previews(self, run: StrategyRun) -> list[dict[str, Any]]:
+        previews: list[dict[str, Any]] = []
         for idx, item in enumerate(self._get_detail_tool_calls(run)):
-            tool_name = str(item.get("name") or "")
-            tool_text = self._get_api_tool_text(tool_name)
-            result = item.get("result")
-            if not isinstance(result, dict):
-                continue
-            raw_payload = result.get("result")
-            preview_source = raw_payload if raw_payload is not None else result
-            previews.append(
-                {
-                    "preview_index": idx,
-                    "tool_name": tool_name,
-                    "display_name": tool_text["name"],
-                    "summary": str(result.get("summary") or tool_text["summary"]),
-                    "preview": self._format_tool_preview(preview_source),
-                }
-            )
+            preview = self._build_raw_tool_preview_item(item, idx)
+            if preview is not None:
+                previews.append(preview)
         return previews
 
-    def _format_tool_preview(self, payload: Any, max_chars: int = 6000) -> str:
+    def _build_raw_tool_preview_by_index(
+        self, run: StrategyRun, preview_index: int
+    ) -> dict[str, Any] | None:
+        for idx, item in enumerate(self._get_detail_tool_calls(run)):
+            if idx != preview_index:
+                continue
+            return self._build_raw_tool_preview_item(item, idx, truncate=False)
+        return None
+
+    def _build_raw_tool_preview_item(
+        self,
+        item: dict[str, Any],
+        preview_index: int,
+        *,
+        truncate: bool = True,
+    ) -> dict[str, Any] | None:
+        tool_name = str(item.get("name") or "")
+        tool_text = self._get_api_tool_text(tool_name)
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return None
+        raw_payload = result.get("result")
+        preview_source = raw_payload if raw_payload is not None else result
+        full_preview = self._format_tool_preview(preview_source, truncate=False)
+        truncated = len(full_preview) > RAW_TOOL_PREVIEW_MAX_CHARS
+        preview = self._format_tool_preview(preview_source) if truncate else full_preview
+        return {
+            "preview_index": preview_index,
+            "tool_name": tool_name,
+            "display_name": tool_text["name"],
+            "summary": str(result.get("summary") or tool_text["summary"]),
+            "preview": preview,
+            "truncated": truncated if truncate else False,
+            "full_preview": full_preview,
+        }
+
+    def _format_tool_preview(
+        self,
+        payload: Any,
+        max_chars: int = RAW_TOOL_PREVIEW_MAX_CHARS,
+        *,
+        truncate: bool = True,
+    ) -> str:
         try:
             text = json.dumps(payload, ensure_ascii=False, indent=2)
         except (TypeError, ValueError):
             text = str(payload)
         text = text.strip()
-        if len(text) <= max_chars:
+        if not truncate or len(text) <= max_chars:
             return text
         return text[: max_chars - 16].rstrip() + "\n...\n<已截断>"
 
@@ -999,13 +1208,25 @@ class AniuService:
     def _fetch_live_account_payloads(
         self, client: MXClient
     ) -> dict[str, dict[str, Any]]:
-        with ThreadPoolExecutor(max_workers=ACCOUNT_OVERVIEW_CACHE_MAX_WORKERS) as executor:
-            futures = {
-                "balance": executor.submit(self._safe_call, client.get_balance),
-                "positions": executor.submit(self._safe_call, client.get_positions),
-                "orders": executor.submit(self._safe_call, client.get_orders),
-            }
-        return {name: future.result() for name, future in futures.items()}
+        return {
+            "balance": self._safe_call(client.get_balance),
+            "positions": self._safe_call(client.get_positions),
+            "orders": self._safe_call(client.get_orders),
+        }
+
+    def _extract_tool_result(
+        self, tool_calls: list[dict[str, Any]], tool_name: str
+    ) -> dict[str, Any] | None:
+        for item in reversed(tool_calls):
+            if item.get("name") != tool_name:
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            payload = result.get("result")
+            if isinstance(payload, dict):
+                return payload
+        return None
 
     def get_account_overview(
         self,
@@ -1496,6 +1717,7 @@ class AniuService:
         self,
         trigger_source: str,
         schedule_id: int | None,
+        manual_run_type: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
@@ -1504,32 +1726,61 @@ class AniuService:
             )
             if schedule_id is not None and schedule is None:
                 raise RuntimeError("指定的定时任务不存在。")
+            manual_resolved_run_type, manual_task_prompt = self._resolve_manual_run_profile(
+                settings=settings,
+                manual_run_type=manual_run_type,
+            )
             run = StrategyRun(
                 trigger_source=trigger_source,
-                run_type=schedule.run_type if schedule else "analysis",
+                run_type=schedule.run_type if schedule else manual_resolved_run_type,
+                schedule_id=schedule.id if schedule else None,
                 schedule_name=schedule.name if schedule else None,
                 status="running",
             )
             db.add(run)
             db.flush()
             run_id = run.id
-            manual_task_prompt = str(
-                getattr(settings, "task_prompt", "") or ""
-            ).strip() or (
-                "请先分析当前情况，必要时自行调用妙想工具获取数据，并在需要时执行模拟交易。"
-                "最后用自然语言总结本次判断、依据和操作结果。"
-            )
             settings_snapshot = {
                 "id": settings.id,
                 "mx_api_key": settings.mx_api_key,
                 "llm_base_url": settings.llm_base_url,
                 "llm_api_key": settings.llm_api_key,
                 "llm_model": settings.llm_model,
-                "run_type": schedule.run_type if schedule else "analysis",
+                "run_type": schedule.run_type if schedule else manual_resolved_run_type,
+                "schedule_id": schedule.id if schedule else None,
                 "system_prompt": settings.system_prompt,
                 "task_prompt": schedule.task_prompt if schedule else manual_task_prompt,
                 "timeout_seconds": int(
                     schedule.timeout_seconds if schedule else 1800
+                ),
+                "automation_session_id": getattr(
+                    settings, "automation_session_id", None
+                ),
+                "automation_context_window_tokens": getattr(
+                    settings,
+                    "automation_context_window_tokens",
+                    AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS,
+                ),
+                "automation_target_prompt_tokens": getattr(
+                    settings,
+                    "automation_target_prompt_tokens",
+                    AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS,
+                ),
+                "automation_recent_message_limit": getattr(
+                    settings,
+                    "automation_recent_message_limit",
+                    AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT,
+                ),
+                "automation_enable_auto_compaction": getattr(
+                    settings, "automation_enable_auto_compaction", True
+                ),
+                "automation_idle_summary_hours": getattr(
+                    settings,
+                    "automation_idle_summary_hours",
+                    AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS,
+                ),
+                "automation_context_source": getattr(
+                    settings, "automation_context_source", "default"
                 ),
             }
         return run_id, settings_snapshot
@@ -1544,8 +1795,8 @@ class AniuService:
         emit: Any = None,
         return_full_run: bool = True,
     ) -> StrategyRun | None:
-        prefetched_tool_calls: list[dict[str, Any]] = []
-        prefetched_context: str | None = None
+        session_context: PersistentRunSessionContext | None = None
+        automation_phase = "llm"
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
 
         try:
@@ -1568,52 +1819,26 @@ class AniuService:
                 raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
             client = MXClient(api_key=settings.mx_api_key)
             try:
-                _emit("stage", stage="prefetch", message="正在预取账户数据")
-                prefetched_tool_calls = self._prefetch_account_tool_calls(
-                    client=client,
-                    app_settings=settings,
-                )
-                for call in prefetched_tool_calls:
-                    _emit(
-                        "tool_call",
-                        phase="prefetch",
-                        tool_name=call.get("tool_name") or call.get("name"),
-                        status="done",
-                        ok=bool(call.get("ok", True)),
-                        summary=call.get("summary"),
-                    )
-                prefetched_context = self._build_prefetched_account_context(
-                    prefetched_tool_calls
-                )
-                if prefetched_context:
-                    original_task_prompt = str(
-                        getattr(settings, "task_prompt", "") or ""
-                    ).strip()
-                    settings.task_prompt = (
-                        f"{original_task_prompt}\n\n{prefetched_context}"
-                        if original_task_prompt
-                        else prefetched_context
-                    )
                 _emit("stage", stage="llm", message="正在调用大模型")
-                run_agent = llm_service.run_agent
-                if self._run_agent_supports_emit(run_agent):
-                    decision, llm_request, llm_response, runtime_trace = run_agent(
-                        settings,
-                        client,
+                session_context = self._prepare_persistent_session_context(
+                    run_id=run_id,
+                    settings=settings,
+                    trigger_source=trigger_source,
+                    schedule_id=schedule_id,
+                )
+                decision, llm_request, llm_response, runtime_trace = (
+                    llm_service.run_agent_with_messages(
+                        app_settings=settings,
+                        client=client,
+                        messages=session_context.messages,
                         emit=_emit,
                     )
-                else:
-                    decision, llm_request, llm_response, runtime_trace = run_agent(
-                        settings,
-                        client,
-                    )
+                )
             finally:
                 client.close()
 
             tool_calls = decision.get("tool_calls")
             skill_payloads = {
-                "prefetched_tool_calls": prefetched_tool_calls,
-                "prefetched_context": prefetched_context,
                 "tool_calls": tool_calls,
                 "runtime_trace": runtime_trace,
             }
@@ -1643,6 +1868,16 @@ class AniuService:
                 run = db.get(StrategyRun, run_id)
                 if run is None:
                     raise RuntimeError("运行记录不存在。")
+                run.chat_session_id = session_context.session_id if session_context else None
+                run.prompt_message_id = (
+                    session_context.prompt_message_id if session_context else None
+                )
+                run.context_summary_version = (
+                    session_context.summary_revision if session_context else None
+                )
+                run.context_tokens_estimate = (
+                    session_context.context_tokens_estimate if session_context else None
+                )
                 run.skill_payloads = skill_payloads
                 run.llm_request_payload = llm_request
                 run.llm_response_payload = llm_response
@@ -1685,6 +1920,52 @@ class AniuService:
                             from_time=completed_at_shanghai,
                         )
                         db.add(schedule)
+
+                if session_context is not None:
+                    session = db.get(ChatSession, session_context.session_id)
+                    if session is not None:
+                        assistant_content = self._build_persistent_session_assistant_content(
+                            run_id=run_id,
+                            run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                            status="completed",
+                            final_answer=str(decision.get("final_answer") or "").strip()
+                            or None,
+                            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+                            executed_actions=executed_actions,
+                        )
+                        response_message = self._persist_persistent_session_assistant_message(
+                            db=db,
+                            session=session,
+                            run_id=run_id,
+                            content=assistant_content,
+                            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+                            status="completed",
+                            meta_payload={
+                                "run_type": str(
+                                    getattr(settings, "run_type", "analysis") or "analysis"
+                                ),
+                                "executed_action_count": len(executed_actions),
+                            },
+                        )
+                        session_context.response_message_id = response_message.id
+                        run.response_message_id = response_message.id
+                        archived_summary, summary_version = (
+                            self._maybe_compact_persistent_session(
+                                db=db,
+                                session=session,
+                                settings=settings,
+                                estimated_tokens=int(
+                                    session_context.context_tokens_estimate or 0
+                                ),
+                            )
+                        )
+                        del archived_summary
+                        run.context_summary_version = (
+                            int(summary_version)
+                            if summary_version is not None
+                            else run.context_summary_version
+                        )
+                        db.add(run)
 
             for action in persisted_trade_orders:
                 _emit(
@@ -1733,24 +2014,58 @@ class AniuService:
             with session_scope() as db:
                 run = db.get(StrategyRun, run_id)
                 if run is not None:
-                    if prefetched_tool_calls:
-                        existing_skill_payloads = (
-                            run.skill_payloads
-                            if isinstance(run.skill_payloads, dict)
-                            else {}
-                        )
-                        existing_skill_payloads["prefetched_tool_calls"] = (
-                            prefetched_tool_calls
-                        )
-                        existing_skill_payloads["prefetched_context"] = (
-                            prefetched_context
-                        )
-                        run.skill_payloads = existing_skill_payloads
+                    run.chat_session_id = (
+                        session_context.session_id if session_context else None
+                    )
+                    run.prompt_message_id = (
+                        session_context.prompt_message_id if session_context else None
+                    )
+                    run.response_message_id = (
+                        session_context.response_message_id if session_context else None
+                    )
+                    run.context_summary_version = (
+                        session_context.summary_revision if session_context else None
+                    )
+                    run.context_tokens_estimate = (
+                        session_context.context_tokens_estimate
+                        if session_context
+                        else None
+                    )
                     run.status = "failed"
                     run.error_message = str(exc)
                     run.final_answer = None
                     run.finished_at = now_utc()
                     db.add(run)
+                    if session_context is not None:
+                        session = db.get(ChatSession, session_context.session_id)
+                        if session is not None:
+                            assistant_content = self._build_persistent_session_assistant_content(
+                                run_id=run_id,
+                                run_type=str(settings_snapshot.get("run_type") or "analysis"),
+                                status="failed",
+                                final_answer=None,
+                                tool_calls=None,
+                                executed_actions=None,
+                                error_message=str(exc),
+                                phase=automation_phase,
+                            )
+                            response_message = self._persist_persistent_session_assistant_message(
+                                db=db,
+                                session=session,
+                                run_id=run_id,
+                                content=assistant_content,
+                                tool_calls=None,
+                                status="failed",
+                                meta_payload={
+                                    "phase": automation_phase,
+                                    "run_type": str(
+                                        settings_snapshot.get("run_type") or "analysis"
+                                    ),
+                                },
+                            )
+                            run.response_message_id = response_message.id
+                            session_context.response_message_id = response_message.id
+                            db.add(run)
                 if schedule_id:
                     schedule = db.get(StrategySchedule, schedule_id)
                     if schedule is not None:
@@ -1777,11 +2092,16 @@ class AniuService:
         self,
         trigger_source: str = "manual",
         schedule_id: int | None = None,
+        manual_run_type: str | None = None,
     ) -> StrategyRun:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("已有运行中的任务，请稍后再试。")
         try:
-            run_id, settings_snapshot = self._prepare_run(trigger_source, schedule_id)
+            run_id, settings_snapshot = self._prepare_run(
+                trigger_source,
+                schedule_id,
+                manual_run_type,
+            )
             return self._run_body(
                 run_id=run_id,
                 settings_snapshot=settings_snapshot,
@@ -1795,6 +2115,7 @@ class AniuService:
         self,
         trigger_source: str = "manual",
         schedule_id: int | None = None,
+        manual_run_type: str | None = None,
     ) -> int:
         """Launch a run on a background thread and return its run_id immediately.
 
@@ -1805,7 +2126,11 @@ class AniuService:
 
         run_id: int | None = None
         try:
-            run_id, settings_snapshot = self._prepare_run(trigger_source, schedule_id)
+            run_id, settings_snapshot = self._prepare_run(
+                trigger_source,
+                schedule_id,
+                manual_run_type,
+            )
         except Exception:
             self._run_lock.release()
             raise
@@ -1949,130 +2274,6 @@ class AniuService:
             )
         return combined_tool_calls
 
-    def _prefetch_account_tool_calls(
-        self,
-        *,
-        client: MXClient,
-        app_settings: Any,
-    ) -> list[dict[str, Any]]:
-        del app_settings
-        live_payloads = self._fetch_live_account_payloads(client)
-        payload_map = {
-            "mx_get_balance": ("balance", "已查询账户资金。"),
-            "mx_get_positions": ("positions", "已查询持仓。"),
-            "mx_get_orders": ("orders", "已查询委托记录。"),
-        }
-
-        tool_calls: list[dict[str, Any]] = []
-        for tool_name in ACCOUNT_PREFETCH_TOOL_NAMES:
-            payload_key, summary = payload_map[tool_name]
-            raw_result = live_payloads[payload_key]
-            result: dict[str, Any] = {
-                "ok": bool(raw_result.get("ok")),
-                "tool_name": tool_name,
-            }
-            if raw_result.get("ok"):
-                result["summary"] = summary
-                result["result"] = raw_result.get("result")
-            else:
-                result["error"] = str(raw_result.get("error") or "预取失败")
-
-            tool_calls.append(
-                {
-                    "name": tool_name,
-                    "arguments": {},
-                    "ok": result["ok"],
-                    "summary": result.get("summary"),
-                    "result": result,
-                }
-            )
-        return tool_calls
-
-    def _build_prefetched_account_context(
-        self, tool_calls: list[dict[str, Any]]
-    ) -> str | None:
-        if not tool_calls:
-            return None
-
-        balance_result = self._extract_tool_result(tool_calls, "mx_get_balance")
-        positions_result = self._extract_tool_result(tool_calls, "mx_get_positions")
-        orders_result = self._extract_tool_result(tool_calls, "mx_get_orders")
-
-        lines = [
-            "系统已在本轮开始前预取账户快照，可直接使用；如需更实时或更细粒度的数据，再调用对应工具。"
-        ]
-
-        if balance_result is not None or positions_result is not None:
-            overview = self._build_account_overview(balance_result, positions_result)
-            lines.append(
-                "账户快照："
-                f"总资产={self._format_prefetch_number(overview.get('total_assets'))}，"
-                f"现金余额={self._format_prefetch_number(overview.get('cash_balance'))}，"
-                f"持仓市值={self._format_prefetch_number(overview.get('total_market_value'))}，"
-                f"当日盈亏={self._format_prefetch_number(overview.get('daily_profit'))}。"
-            )
-            positions = overview.get("positions") or []
-            if positions:
-                position_preview = "；".join(
-                    (
-                        f"{item.get('name') or item.get('symbol')} "
-                        f"{int(_parse_float(item.get('volume')) or 0)}股"
-                    )
-                    for item in positions[:3]
-                    if isinstance(item, dict)
-                )
-                if position_preview:
-                    lines.append(
-                        f"持仓快照：共 {len(positions)} 条；前 3 条：{position_preview}。"
-                    )
-
-        normalized_orders = self._build_orders_overview(orders_result)
-        if normalized_orders:
-            order_preview = "；".join(
-                (
-                    f"{item.get('side_text') or '--'} "
-                    f"{item.get('name') or item.get('symbol') or '--'} "
-                    f"{item.get('status_text') or '--'}"
-                )
-                for item in normalized_orders[:3]
-                if isinstance(item, dict)
-            )
-            lines.append(
-                f"委托快照：共 {len(normalized_orders)} 条；前 3 条：{order_preview}。"
-            )
-
-        failed_prefetches = [
-            f"{item.get('name')}: {item.get('result', {}).get('error')}"
-            for item in tool_calls
-            if isinstance(item, dict)
-            and isinstance(item.get("result"), dict)
-            and not item.get("result", {}).get("ok")
-        ]
-        if failed_prefetches:
-            lines.append("预取失败：" + "；".join(failed_prefetches) + "。")
-
-        return "\n".join(lines)
-
-    def _format_prefetch_number(self, value: Any) -> str:
-        numeric = _parse_float(value)
-        if numeric is None:
-            return "--"
-        return f"{numeric:.2f}"
-
-    def _extract_tool_result(
-        self, tool_calls: list[dict[str, Any]], tool_name: str
-    ) -> dict[str, Any] | None:
-        for item in reversed(tool_calls):
-            if item.get("name") != tool_name:
-                continue
-            result = item.get("result")
-            if not isinstance(result, dict) or not result.get("ok"):
-                continue
-            payload = result.get("result")
-            if isinstance(payload, dict):
-                return payload
-        return None
-
     def _extract_executed_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
         if not isinstance(tool_calls, list):
             return []
@@ -2121,6 +2322,493 @@ class AniuService:
         if len(compact) <= 120:
             return compact
         return compact[:117] + "..."
+
+    def _prepare_persistent_session_context(
+        self,
+        *,
+        run_id: int,
+        settings: Any,
+        trigger_source: str,
+        schedule_id: int | None,
+    ) -> PersistentRunSessionContext:
+        with session_scope() as db:
+            session = self._get_or_create_persistent_session(db)
+            user_content = self._build_persistent_session_user_content(
+                settings=settings,
+                trigger_source=trigger_source,
+                schedule_id=schedule_id,
+                schedule_name=getattr(settings, "schedule_name", None),
+                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                task_prompt=str(getattr(settings, "task_prompt", "") or ""),
+                prefetched_context=None,
+            )
+            user_message = self._persist_persistent_session_user_message(
+                db=db,
+                session=session,
+                run_id=run_id,
+                content=user_content,
+                schedule_id=schedule_id,
+                schedule_name=getattr(settings, "schedule_name", None),
+                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                trigger_source=trigger_source,
+            )
+            history_records = self._list_persistent_session_history_records(
+                db=db,
+                session_id=session.id,
+                recent_limit=int(
+                    getattr(settings, "automation_recent_message_limit", 0)
+                    or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
+                ),
+            )
+            history_messages = self._build_persistent_session_history_messages(
+                history_records
+            )
+            messages = self._build_persistent_session_prompt_messages(
+                session=session,
+                history_messages=history_messages,
+                memory_messages=self._retrieve_persistent_session_memory_messages(
+                    session=session,
+                    settings=settings,
+                    run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                    task_prompt=str(getattr(settings, "task_prompt", "") or ""),
+                ),
+            )
+            context_tokens_estimate = self._estimate_persistent_session_context_tokens(
+                session=session,
+                settings=settings,
+                messages=messages,
+            )
+            context_tokens_estimate = max(
+                context_tokens_estimate,
+                estimate_messages_tokens(history_messages),
+            )
+            with db.no_autoflush:
+                run = db.get(StrategyRun, run_id)
+                if run is not None:
+                    run.chat_session_id = session.id
+                    run.prompt_message_id = user_message.id
+                    run.context_tokens_estimate = context_tokens_estimate
+                    run.context_summary_version = int(session.summary_revision or 0)
+                    db.add(run)
+
+            return PersistentRunSessionContext(
+                session_id=session.id,
+                prompt_message_id=user_message.id,
+                response_message_id=None,
+                summary_revision=int(session.summary_revision or 0),
+                context_tokens_estimate=context_tokens_estimate,
+                messages=messages,
+            )
+
+    def _get_or_create_persistent_session(self, db: Session) -> ChatSession:
+        settings = self.get_or_create_settings(db)
+        session_id = int(getattr(settings, "automation_session_id", 0) or 0)
+        if session_id > 0:
+            existing = db.get(ChatSession, session_id)
+            if existing is not None and str(existing.kind or "") == "automation":
+                return existing
+
+        session = db.scalar(
+            select(ChatSession).where(
+                ChatSession.kind == "automation",
+                ChatSession.slug == AUTOMATION_SESSION_SLUG,
+            )
+        )
+        if session is None:
+            session = ChatSession(
+                title=AUTOMATION_SESSION_TITLE,
+                kind="automation",
+                slug=AUTOMATION_SESSION_SLUG,
+            )
+            db.add(session)
+            db.flush()
+
+        settings.automation_session_id = session.id
+        settings.automation_context_window_tokens = int(
+            getattr(settings, "automation_context_window_tokens", None)
+            or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
+        )
+        settings.automation_target_prompt_tokens = int(
+            getattr(settings, "automation_target_prompt_tokens", None)
+            or AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS
+        )
+        settings.automation_recent_message_limit = int(
+            getattr(settings, "automation_recent_message_limit", None)
+            or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
+        )
+        settings.automation_idle_summary_hours = int(
+            getattr(settings, "automation_idle_summary_hours", None)
+            or AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS
+        )
+        settings.automation_context_source = (
+            str(getattr(settings, "automation_context_source", "") or "").strip()
+            or "default"
+        )
+        settings.automation_context_detected_at = now_utc()
+        if hasattr(settings, "_sa_instance_state"):
+            db.add(settings)
+        return session
+
+    def _build_persistent_session_user_content(
+        self,
+        *,
+        settings: Any,
+        trigger_source: str,
+        schedule_id: int | None,
+        schedule_name: str | None,
+        run_type: str,
+        task_prompt: str,
+        prefetched_context: str | None,
+    ) -> str:
+        current_time = now_shanghai()
+        run_time = (
+            f"{current_time.year}年{current_time.month}月{current_time.day}日 "
+            f"{current_time.strftime('%H:%M:%S')}"
+        )
+        trigger_source_text = (
+            "定时触发" if str(trigger_source or "").strip() == "schedule" else "手动触发"
+        )
+        task_type_text = (
+            "交易任务" if str(run_type or "").strip() == "trade" else "分析任务"
+        )
+        lines = [
+            f"时间：{run_time}",
+            f"来源: {trigger_source_text}",
+            f"任务类型: {task_type_text}",
+            "",
+            "本轮任务:",
+            str(task_prompt or "").strip() or "--",
+        ]
+        del settings, schedule_name, prefetched_context
+        return "\n".join(lines).strip()
+
+    def _build_persistent_session_assistant_content(
+        self,
+        *,
+        run_id: int,
+        run_type: str,
+        status: str,
+        final_answer: str | None,
+        tool_calls: list[dict[str, Any]] | None,
+        executed_actions: list[dict[str, Any]] | None,
+        error_message: str | None = None,
+        phase: str | None = None,
+    ) -> str:
+        content = str(final_answer or "").strip()
+
+        if status == "completed":
+            del executed_actions, tool_calls, run_id, run_type
+            return content or "本轮已完成，但未生成额外说明。"
+
+        del executed_actions, tool_calls, run_id, run_type, phase
+        return f"执行失败：{str(error_message or '未知错误').strip() or '未知错误'}"
+
+    def _persist_persistent_session_user_message(
+        self,
+        *,
+        db: Session,
+        session: ChatSession,
+        run_id: int,
+        content: str,
+        schedule_id: int | None,
+        schedule_name: str | None,
+        run_type: str,
+        trigger_source: str,
+    ) -> ChatMessageRecord:
+        record = ChatMessageRecord(
+            session_id=session.id,
+            role="user",
+            content=content,
+            source="automation_run",
+            run_id=run_id,
+            message_kind="live_turn",
+            meta_payload={
+                "trigger_source": trigger_source,
+                "schedule_id": schedule_id,
+                "schedule_name": schedule_name,
+                "run_type": run_type,
+            },
+        )
+        db.add(record)
+        db.flush()
+        session.last_message_at = now_utc()
+        db.add(session)
+        return record
+
+    def _slim_automation_tool_calls(
+        self, tool_calls: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]] | None:
+        if not isinstance(tool_calls, list):
+            return None
+        slimmed: list[dict[str, Any]] = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            entry = {
+                "name": item.get("name"),
+                "tool_call_id": item.get("id") or item.get("tool_call_id"),
+                "arguments": item.get("arguments"),
+                "ok": result.get("ok"),
+                "summary": result.get("summary") or result.get("error"),
+            }
+            executed_action = result.get("executed_action")
+            if isinstance(executed_action, dict):
+                entry["executed_action"] = executed_action
+            slimmed.append(entry)
+        return slimmed or None
+
+    def _persist_persistent_session_assistant_message(
+        self,
+        *,
+        db: Session,
+        session: ChatSession,
+        run_id: int,
+        content: str,
+        tool_calls: list[dict[str, Any]] | None,
+        status: str,
+        meta_payload: dict[str, Any] | None,
+    ) -> ChatMessageRecord:
+        record = ChatMessageRecord(
+            session_id=session.id,
+            role="assistant",
+            content=content,
+            source="automation_run",
+            run_id=run_id,
+            message_kind="live_turn",
+            tool_calls=self._slim_automation_tool_calls(tool_calls),
+            meta_payload={"status": status, **(meta_payload or {})} or None,
+        )
+        db.add(record)
+        db.flush()
+        session.last_message_at = now_utc()
+        db.add(session)
+        return record
+
+    def _list_persistent_session_history_records(
+        self,
+        *,
+        db: Session,
+        session_id: int,
+        recent_limit: int,
+    ) -> list[ChatMessageRecord]:
+        limit = max(4, int(recent_limit or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT))
+        session = db.get(ChatSession, session_id)
+        last_compacted_message_id = int(
+            getattr(session, "last_compacted_message_id", 0) or 0
+        )
+        stmt = (
+            select(ChatMessageRecord)
+            .where(ChatMessageRecord.session_id == session_id)
+            .order_by(ChatMessageRecord.id.desc())
+            .limit(limit)
+        )
+        if last_compacted_message_id > 0:
+            stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
+        records = (
+            db.execute(
+                stmt
+            )
+            .scalars()
+            .all()
+        )
+        records.reverse()
+        return records
+
+    def _build_persistent_session_history_messages(
+        self, records: list[ChatMessageRecord]
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for record in records:
+            if record.role not in {"user", "assistant", "system"}:
+                continue
+            content = str(record.content or "").strip()
+            if not content:
+                continue
+            messages.append({"role": record.role, "content": content})
+        return messages
+
+    def _retrieve_persistent_session_memory_messages(
+        self,
+        *,
+        session: ChatSession,
+        settings: Any,
+        run_type: str,
+        task_prompt: str,
+    ) -> list[dict[str, Any]]:
+        # Placeholder hook for future vector retrieval. Keep the contract stable
+        # so long-term memory can be injected without reshaping the main run flow.
+        del session, settings, run_type, task_prompt
+        return []
+
+    def _estimate_persistent_session_context_tokens(
+        self,
+        *,
+        session: ChatSession,
+        settings: Any,
+        messages: list[dict[str, Any]],
+    ) -> int:
+        estimate = estimate_messages_tokens(messages)
+        estimate += estimate_text_tokens(getattr(settings, "system_prompt", None))
+        estimate += estimate_text_tokens(session.archived_summary)
+        return estimate
+
+    def _build_persistent_session_context_system_message(
+        self,
+        *,
+        session: ChatSession,
+    ) -> dict[str, Any] | None:
+        archived_summary = str(session.archived_summary or "").strip()
+        if not archived_summary:
+            return None
+        return {"role": "system", "content": "[上下文压缩摘要]\n" + archived_summary}
+
+    def _build_persistent_session_prompt_messages(
+        self,
+        *,
+        session: ChatSession,
+        history_messages: list[dict[str, Any]],
+        memory_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        context_message = self._build_persistent_session_context_system_message(
+            session=session,
+        )
+        if context_message is not None:
+            messages.append(context_message)
+        messages.extend(memory_messages)
+        messages.extend(history_messages)
+        return messages
+
+    def _build_compacted_summary_text(
+        self, records: list[ChatMessageRecord]
+    ) -> str | None:
+        if not records:
+            return None
+        assistant_records = [record for record in records if record.role == "assistant"]
+        if not assistant_records:
+            return None
+        recent = assistant_records[-6:]
+        lines = [
+            "## 当前策略",
+            "- 结合最近自动化运行的结论、失败记录和账户快照继续决策。",
+            "## 已执行动作",
+        ]
+        for record in recent:
+            summary = self._build_analysis_summary(record.content)
+            run_id = record.run_id if record.run_id is not None else "--"
+            if summary:
+                lines.append(f"- run_id {run_id}: {summary}")
+        lines.extend(
+            [
+                "## 当前约束",
+                "- 原始运行记录和交易记录以 StrategyRun / TradeOrder 为准。",
+                "- 账户实时数字应以本轮最新快照和工具结果为准。",
+                "## 后续计划",
+                "- 下一轮结合最新账户快照，延续、调整或推翻之前计划。",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _safe_prompt_budget(self, settings: Any) -> int:
+        context_window = int(
+            getattr(settings, "automation_context_window_tokens", 0)
+            or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
+        )
+        safe_budget = max(
+            2048,
+            context_window
+            - AUTOMATION_RESERVED_OUTPUT_TOKENS
+            - AUTOMATION_SAFETY_BUFFER_TOKENS,
+        )
+        configured_target = int(
+            getattr(settings, "automation_target_prompt_tokens", 0)
+            or AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS
+        )
+        return min(configured_target, int(safe_budget * 0.7))
+
+    def _should_compact_automation_session(
+        self,
+        *,
+        session: ChatSession,
+        records: list[ChatMessageRecord],
+        settings: Any,
+        estimated_tokens: int,
+    ) -> bool:
+        if not bool(getattr(settings, "automation_enable_auto_compaction", True)):
+            return False
+        recent_limit = int(
+            getattr(settings, "automation_recent_message_limit", 0)
+            or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
+        )
+        if len(records) > recent_limit:
+            return True
+        if estimated_tokens > self._safe_prompt_budget(settings):
+            return True
+        last_message_at = _assume_utc(session.last_message_at)
+        idle_hours = int(
+            getattr(settings, "automation_idle_summary_hours", 0)
+            or AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS
+        )
+        if last_message_at is not None and idle_hours > 0:
+            if now_utc() - last_message_at >= timedelta(hours=idle_hours):
+                return True
+        return False
+
+    def _maybe_compact_persistent_session(
+        self,
+        *,
+        db: Session,
+        session: ChatSession,
+        settings: Any,
+        estimated_tokens: int,
+    ) -> tuple[str | None, int | None]:
+        records = (
+            db.execute(
+                select(ChatMessageRecord)
+                .where(ChatMessageRecord.session_id == session.id)
+                .order_by(ChatMessageRecord.id.asc())
+            )
+            .scalars()
+            .all()
+        )
+        if not self._should_compact_automation_session(
+            session=session,
+            records=records,
+            settings=settings,
+            estimated_tokens=estimated_tokens,
+        ):
+            return session.archived_summary, session.summary_revision
+
+        recent_limit = max(
+            8,
+            int(
+                getattr(settings, "automation_recent_message_limit", 0)
+                or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
+            )
+            // 2,
+        )
+        compact_cutoff = max(0, len(records) - recent_limit)
+        compact_candidates = records[:compact_cutoff]
+        if len(compact_candidates) < 2:
+            return session.archived_summary, session.summary_revision
+        if len(compact_candidates) % 2 == 1:
+            compact_candidates = compact_candidates[:-1]
+        if len(compact_candidates) < 2:
+            return session.archived_summary, session.summary_revision
+
+        summary = self._build_compacted_summary_text(compact_candidates)
+        if not summary:
+            return session.archived_summary, session.summary_revision
+
+        session.archived_summary = summary
+        session.summary_updated_at = now_utc()
+        session.last_compacted_message_id = compact_candidates[-1].id
+        last_run_id = compact_candidates[-1].run_id
+        session.last_compacted_run_id = int(last_run_id) if last_run_id else None
+        session.summary_revision = int(session.summary_revision or 0) + 1
+        db.add(session)
+        return session.archived_summary, session.summary_revision
 
     def _compute_next_run_at(
         self,

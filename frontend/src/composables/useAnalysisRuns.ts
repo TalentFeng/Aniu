@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 
-import type { ApiDetail, RawToolPreview, RunDetail, RunSummary, RunSummaryPage, TradeDetail, TradeOrder } from '@/types'
+import type { ApiDetail, RawToolPreview, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, TradeDetail, TradeOrder } from '@/types'
 
 export interface AnalysisRunViewModel {
   id: number
@@ -318,29 +318,28 @@ function getLatestRun(runs: AnalysisRunViewModel[]) {
 export function useAnalysisRuns(options: {
   listRunsPage: (options?: { limit?: number, date?: string, status?: string, beforeId?: number }) => Promise<RunSummaryPage>
   loadRunDetail: (runId: number, options?: { force?: boolean }) => Promise<RunDetail>
+  loadRawToolPreview: (runId: number, previewIndex: number) => Promise<RawToolPreviewDetail>
 }) {
   const selectedRun = ref<AnalysisRunViewModel | null>(null)
   const selectedRunLoading = ref(false)
   const renderedOutputHtml = ref('')
   const renderedOutputLoading = ref(false)
-  const showFailedRuns = ref(false)
   const todayRuns = ref<AnalysisRunViewModel[]>([])
   const historyRuns = ref<AnalysisRunViewModel[]>([])
-  const todaySuccessCount = ref(0)
-  const todayFailedCount = ref(0)
   const selectedDate = ref('')
   const loading = ref(false)
   const errorMessage = ref('')
   const runCache = new Map<number, AnalysisRunViewModel>()
   const markdownCache = new Map<string, string>()
   const sourceSummaries = ref<RunSummary[]>([])
+  const rawToolPreviewRequests = new Map<string, Promise<RawToolPreviewDetail>>()
 
   let markdownRendererPromise: Promise<((content: string) => string)> | null = null
 
   const allRuns = computed(() => sourceSummaries.value)
 
   function shouldIncludeRun(run: AnalysisRunViewModel) {
-    return showFailedRuns.value || run.status !== 'failed'
+    return !!run
   }
 
   function filterVisibleRuns(runs: AnalysisRunViewModel[]) {
@@ -397,6 +396,63 @@ export function useAnalysisRuns(options: {
     return detail
   }
 
+  async function ensureRawToolPreview(runId: number, previewIndex: number): Promise<RawToolPreview> {
+    const run = runCache.get(runId)
+    const cachedPreview = run?.rawToolPreviews.find((item) => item.preview_index === previewIndex) ?? null
+    if (cachedPreview && !cachedPreview.truncated) {
+      return cachedPreview
+    }
+
+    const requestKey = `${runId}:${previewIndex}`
+    const pendingRequest = rawToolPreviewRequests.get(requestKey)
+    if (pendingRequest) {
+      const detail = await pendingRequest
+      return applyRawToolPreviewDetail(runId, detail)
+    }
+
+    const request = options.loadRawToolPreview(runId, previewIndex)
+    rawToolPreviewRequests.set(requestKey, request)
+    try {
+      const detail = await request
+      return applyRawToolPreviewDetail(runId, detail)
+    } finally {
+      rawToolPreviewRequests.delete(requestKey)
+    }
+  }
+
+  function applyRawToolPreviewDetail(runId: number, detail: RawToolPreviewDetail): RawToolPreview {
+    const run = runCache.get(runId)
+    const nextPreview: RawToolPreview = {
+      preview_index: detail.preview_index,
+      tool_name: detail.tool_name,
+      display_name: detail.display_name,
+      summary: detail.summary,
+      preview: detail.full_preview,
+      truncated: false,
+    }
+
+    if (!run) {
+      return nextPreview
+    }
+
+    const nextRun: AnalysisRunViewModel = {
+      ...run,
+      rawToolPreviews: run.rawToolPreviews.map((item) => (
+        item.preview_index === detail.preview_index ? nextPreview : item
+      )),
+    }
+    runCache.set(runId, nextRun)
+
+    if (selectedRun.value?.id === runId) {
+      selectedRun.value = nextRun
+    }
+
+    todayRuns.value = todayRuns.value.map((item) => (item.id === runId ? nextRun : item))
+    historyRuns.value = historyRuns.value.map((item) => (item.id === runId ? nextRun : item))
+
+    return nextPreview
+  }
+
   async function loadInitialRuns(config: { syncSelection?: boolean } = {}) {
     const { syncSelection = true } = config
     loading.value = true
@@ -409,8 +465,6 @@ export function useAnalysisRuns(options: {
       const todaysSummaries = sourceSummaries.value.filter((item) => isSameDay(item.started_at, today))
       const mappedTodayRuns = todaysSummaries.map(mapRunSummaryToViewModel)
 
-      todaySuccessCount.value = todaysSummaries.filter((run) => run.status === 'completed').length
-      todayFailedCount.value = todaysSummaries.filter((run) => run.status === 'failed').length
       todayRuns.value = filterVisibleRuns(mappedTodayRuns)
 
       if (syncSelection) {
@@ -419,8 +473,6 @@ export function useAnalysisRuns(options: {
     } catch (error) {
       errorMessage.value = (error as Error).message
       todayRuns.value = []
-      todaySuccessCount.value = 0
-      todayFailedCount.value = 0
       selectedRun.value = null
     } finally {
       loading.value = false
@@ -453,11 +505,6 @@ export function useAnalysisRuns(options: {
       const matched = page.items
       sourceSummaries.value = mergeSourceSummaries(sourceSummaries.value, matched)
       historyRuns.value = filterVisibleRuns(matched.map(mapRunSummaryToViewModel))
-      if (matched.length > 0 && historyRuns.value.length === 0) {
-        errorMessage.value = showFailedRuns.value
-          ? '当前日期没有可展示的运行记录。'
-          : '当前日期仅有失败记录，已按默认设置隐藏。开启“显示失败”后可查看。'
-      }
 
       if (selectedDate.value) {
         await syncSelectedRun(historyRuns.value)
@@ -465,15 +512,6 @@ export function useAnalysisRuns(options: {
     } catch (error) {
       errorMessage.value = (error as Error).message
       historyRuns.value = []
-    }
-  }
-
-  async function toggleFailedRuns() {
-    showFailedRuns.value = !showFailedRuns.value
-    await loadInitialRuns()
-
-    if (selectedDate.value) {
-      await loadHistoryRuns()
     }
   }
 
@@ -547,11 +585,8 @@ export function useAnalysisRuns(options: {
   return {
     selectedRun,
     selectedRunLoading,
-    showFailedRuns,
     todayRuns,
     historyRuns,
-    todaySuccessCount,
-    todayFailedCount,
     selectedDate,
     loading,
     errorMessage,
@@ -560,7 +595,7 @@ export function useAnalysisRuns(options: {
     loadInitialRuns,
     selectRun,
     refreshRunDetail,
+    ensureRawToolPreview,
     loadHistoryRuns,
-    toggleFailedRuns,
   }
 }

@@ -122,7 +122,6 @@ const isInputFocused = ref(false)
 const acceptTypes = [
   'image/*',
   'text/*',
-  '.pdf',
   '.md',
   '.markdown',
   '.txt',
@@ -133,11 +132,8 @@ const acceptTypes = [
   '.yaml',
   '.yml',
   '.log',
-  '.doc',
   '.docx',
-  '.xls',
   '.xlsx',
-  '.ppt',
   '.pptx',
 ].join(',')
 

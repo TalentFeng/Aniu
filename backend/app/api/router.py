@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -22,10 +22,13 @@ from app.schemas.aniu import (
     ChatSessionMessagesPageRead,
     ChatSessionRead,
     ChatSessionUpdate,
+    PersistentSessionMessagesPageRead,
+    PersistentSessionRead,
     ChatStreamRequest,
     LoginRequest,
     LoginResponse,
     RunDetailRead,
+    RawToolPreviewDetailRead,
     RunSummaryRead,
     RunSummaryPageRead,
     RuntimeOverviewRead,
@@ -213,10 +216,15 @@ def update_schedule(
 @router.post("/run", response_model=RunDetailRead)
 def run_once(
     schedule_id: int | None = Query(default=None, ge=1),
+    run_type: Literal["analysis", "trade"] | None = Query(default=None),
     _user: str = Depends(get_current_user),
 ) -> RunDetailRead:
     try:
-        return aniu_service.execute_run(trigger_source="manual", schedule_id=schedule_id)
+        return aniu_service.execute_run(
+            trigger_source="manual",
+            schedule_id=schedule_id,
+            manual_run_type=run_type,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
@@ -226,6 +234,7 @@ def run_once(
 @router.post("/run-stream")
 def run_stream(
     schedule_id: int | None = Query(default=None, ge=1),
+    run_type: Literal["analysis", "trade"] | None = Query(default=None),
     _user: str = Depends(get_current_user),
 ) -> dict:
     """Launch a run in the background and return run_id immediately.
@@ -234,7 +243,9 @@ def run_stream(
     """
     try:
         run_id = aniu_service.start_run_async(
-            trigger_source="manual", schedule_id=schedule_id
+            trigger_source="manual",
+            schedule_id=schedule_id,
+            manual_run_type=run_type,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -316,6 +327,37 @@ def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="运行记录不存在。")
     return run
+
+
+@router.get(
+    "/runs/{run_id}/raw-tool-previews/{preview_index}",
+    response_model=RawToolPreviewDetailRead,
+)
+def get_run_raw_tool_preview(
+    run_id: int,
+    preview_index: int = Path(ge=0),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> RawToolPreviewDetailRead:
+    try:
+        return aniu_service.get_run_raw_tool_preview(db, run_id, preview_index)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/runs/{run_id}", status_code=204)
+def delete_run(
+    run_id: int,
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> None:
+    try:
+        aniu_service.delete_run(db, run_id, force=force)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/runtime-overview", response_model=RuntimeOverviewRead)
@@ -466,6 +508,37 @@ def list_chat_messages(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "session": session.model_dump(mode="json"),
+        "messages": [m.model_dump(mode="json") for m in messages],
+        "next_before_id": next_before_id,
+        "has_more": has_more,
+    }
+
+
+@router.get("/persistent-session", response_model=PersistentSessionRead)
+def get_persistent_session(
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> PersistentSessionRead:
+    return aniu_service.get_persistent_session(db)
+
+
+@router.get(
+    "/persistent-session/messages",
+    response_model=PersistentSessionMessagesPageRead,
+)
+def list_persistent_session_messages(
+    limit: int = Query(default=50, ge=1, le=100),
+    before_id: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+    _user: str = Depends(get_current_user),
+) -> PersistentSessionMessagesPageRead:
+    session, messages, next_before_id, has_more = aniu_service.list_persistent_session_messages(
+        db,
+        limit=limit,
+        before_id=before_id,
+    )
     return {
         "session": session.model_dump(mode="json"),
         "messages": [m.model_dump(mode="json") for m in messages],

@@ -13,12 +13,13 @@ from app.core.config import get_settings
 from app.core import rate_limit as rate_limit_module
 from app.db import database as database_module
 from app.db.database import session_scope
-from app.db.models import StrategyRun
+from app.db.models import ChatMessageRecord, ChatSession, StrategyRun
 from app.main import create_app
 from app.skills import skill_registry
 from app.services.event_bus import event_bus
 from app.services.llm_service import llm_service
 from app.services.scheduler_service import scheduler_service
+from app.services.chat_session_service import chat_session_service
 from app.services.trading_calendar_service import trading_calendar_service
 
 
@@ -198,6 +199,42 @@ def test_run_stream_endpoint_is_rate_limited(monkeypatch, tmp_path) -> None:
     get_settings.cache_clear()
 
 
+def test_run_stream_endpoint_passes_manual_trade_run_type(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    captured: dict[str, object] = {}
+
+    def fake_start_run_async(**kwargs):
+      captured.update(kwargs)
+      return 99
+
+    monkeypatch.setattr(aniu_service, "start_run_async", fake_start_run_async)
+    monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(trading_calendar_service, "ensure_years", lambda years: None)
+    monkeypatch.setattr(scheduler_service, "start", lambda: None)
+    monkeypatch.setattr(scheduler_service, "stop", lambda: None)
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    rate_limit_module._limiter.reset()
+    app = create_app()
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _auth_headers(client)
+        response = client.post("/api/aniu/run-stream?run_type=trade", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == 99
+    assert captured["trigger_source"] == "manual"
+    assert captured["schedule_id"] is None
+    assert captured["manual_run_type"] == "trade"
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_app_startup_requires_current_year_trading_calendar(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
@@ -345,6 +382,38 @@ def test_runtime_read_file_can_access_builtin_skill_docs(monkeypatch, tmp_path) 
     get_settings.cache_clear()
 
 
+def test_runtime_read_file_can_access_chat_upload_text_files(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            session = chat_session_service.create_session(db, title="Upload Read")
+            attachment = chat_session_service.save_attachment(
+                db,
+                filename="notes.md",
+                mime_type="text/markdown",
+                data=b"# hello\nworld",
+                session_id=session.id,
+            )
+
+        upload_root = tmp_path / "chat_uploads"
+        targets = list(upload_root.rglob("*.md"))
+        assert len(targets) == 1
+
+        result = skill_registry.execute_tool(
+            tool_name="read_file",
+            arguments={"path": str(targets[0]), "offset": 1, "limit": 20},
+            context={"run_type": "chat"},
+        )
+
+    assert attachment.filename == "notes.md"
+    assert result["ok"] is True
+    assert "1| # hello" in result["result"]["content"]
+    assert "2| world" in result["result"]["content"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_removed_runtime_aliases_are_no_longer_available(monkeypatch, tmp_path) -> None:
     with create_test_client(monkeypatch, tmp_path):
         result = skill_registry.execute_tool(
@@ -382,6 +451,22 @@ def test_chat_system_prompt_always_appends_confirmation_rule(monkeypatch) -> Non
     assert "必须先明确说明拟执行操作、影响范围和潜在风险" in chat_prompt
     assert "得到用户明确确认后才能调用工具或执行操作" in chat_prompt
     assert "必须先明确说明拟执行操作、影响范围和潜在风险" not in analysis_prompt
+
+
+def test_chat_prompt_supplement_limits_read_file_to_plain_text(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        supplement = skill_registry.build_prompt_supplement(run_type="chat")
+        tools = skill_registry.build_tools(run_type="chat")
+
+    read_file_spec = next(
+        spec for spec in tools if spec.get("function", {}).get("name") == "read_file"
+    )
+    description = read_file_spec.get("function", {}).get("description", "")
+
+    assert "纯文本文件" in supplement
+    assert "不要对 PDF、图片、docx/xlsx/pptx 等二进制附件调用 `read_file`" in supplement
+    assert "plain text file" in description
+    assert "Do not use for PDFs, images, Office files, or other binary documents." in description
 
 
 def test_mx_core_tools_can_execute_in_chat_without_prebuilt_client(
@@ -775,6 +860,267 @@ def test_runtime_overview_endpoint_returns_aggregated_stats(monkeypatch, tmp_pat
     assert payload["today"]["api_calls"] == 3
     assert payload["today"]["trades"] == 1
     assert payload["today"]["success_rate"] == 50.0
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_removes_run_and_related_messages(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(title="自动化交易会话", kind="automation", slug="automation-default")
+            db.add(session)
+            db.flush()
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="completed",
+                chat_session_id=session.id,
+            )
+            db.add(run)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="u",
+                        run_id=run.id,
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="a",
+                        run_id=run.id,
+                    ),
+                ]
+            )
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}", headers=headers)
+
+        assert response.status_code == 204
+
+        with session_scope() as db:
+            assert db.get(StrategyRun, run_id) is None
+            linked_messages = (
+                db.query(ChatMessageRecord)
+                .filter(ChatMessageRecord.run_id == run_id)
+                .all()
+            )
+            assert linked_messages == []
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_rejects_running_task(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}", headers=headers)
+
+        assert response.status_code == 409
+        assert "不可删除" in response.json()["detail"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_force_deletes_stuck_running_task(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        headers = _auth_headers(client)
+        response = client.delete(f"/api/aniu/runs/{run_id}?force=true", headers=headers)
+
+        assert response.status_code == 204
+
+        with session_scope() as db:
+            assert db.get(StrategyRun, run_id) is None
+
+    assert aniu_service._run_lock.locked() is False
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_run_endpoint_force_still_rejects_when_service_is_busy(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        acquired = aniu_service._run_lock.acquire(blocking=False)
+        assert acquired is True
+        try:
+            headers = _auth_headers(client)
+            response = client.delete(f"/api/aniu/runs/{run_id}?force=true", headers=headers)
+        finally:
+            aniu_service._run_lock.release()
+
+        assert response.status_code == 409
+        assert "当前仍有任务正在执行" in response.json()["detail"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_persistent_session_endpoint_returns_summary(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="## 当前策略\n- 继续观察",
+                summary_revision=3,
+            )
+            db.add(session)
+            db.flush()
+            db.add(
+                ChatMessageRecord(
+                    session_id=session.id,
+                    role="assistant",
+                    content="summary",
+                )
+            )
+
+        headers = _auth_headers(client)
+        response = client.get("/api/aniu/persistent-session", headers=headers)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["title"] == "自动化交易会话"
+        assert payload["slug"] == "automation-default"
+        assert payload["message_count"] == 1
+        assert payload["summary_revision"] == 3
+        assert "继续观察" in payload["archived_summary"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_context_summary_system_message_uses_compressed_summary_label(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        from app.services.aniu_service import aniu_service
+
+        session = ChatSession(
+            title="自动化交易会话",
+            kind="automation",
+            slug="automation-default",
+            archived_summary="## 当前策略\n- 继续观察",
+        )
+
+        message = aniu_service._build_persistent_session_context_system_message(
+            session=session,
+        )
+
+    assert message == {
+        "role": "system",
+        "content": "[上下文压缩摘要]\n## 当前策略\n- 继续观察",
+    }
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_history_messages_no_longer_append_tool_summaries(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        from app.services.aniu_service import aniu_service
+
+        records = [
+            ChatMessageRecord(
+                role="assistant",
+                content="原始回复",
+                tool_calls=[
+                    {
+                        "name": "mx_query_market",
+                        "result": {"summary": "已读取行情"},
+                    }
+                ],
+            )
+        ]
+
+        messages = aniu_service._build_persistent_session_history_messages(records)
+
+    assert messages == [{"role": "assistant", "content": "原始回复"}]
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_persistent_session_messages_endpoint_returns_messages(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+            )
+            db.add(session)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="first",
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="second",
+                    ),
+                ]
+            )
+
+        headers = _auth_headers(client)
+        response = client.get(
+            "/api/aniu/persistent-session/messages?limit=10",
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["session"]["slug"] == "automation-default"
+        assert [item["content"] for item in payload["messages"]] == ["first", "second"]
+        assert payload["has_more"] is False
 
     database_module._engine = None
     database_module._session_local = None

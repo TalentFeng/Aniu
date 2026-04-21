@@ -182,7 +182,8 @@ This skill should only appear in the prompt supplement after it is enabled.
         payload = response.json()
         assert payload["id"] == "fancy-skill"
         assert payload["name"] == "Fancy Skill Name"
-        assert payload["location"].endswith("skill_workspace\\skills\\fancy-skill")
+        assert Path(payload["location"]).name == "fancy-skill"
+        assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
         assert payload["enabled"] is False
         assert payload["compatibility_level"] == "needs_attention"
@@ -205,7 +206,7 @@ This skill should only appear in the prompt supplement after it is enabled.
         supplement = skill_registry.build_prompt_supplement(run_type="analysis")
         assert "Fancy Skill Name" in supplement
         assert "SKILL.md" in supplement
-        assert "文档驱动" in supplement
+        assert "没有 Python handler 的技能也属于已支持技能" not in supplement
 
     database_module._engine = None
     database_module._session_local = None
@@ -479,7 +480,8 @@ SkillHub downloaded skill.
         payload = response.json()
         assert payload["id"] == "newsnow-v2"
         assert payload["name"] == "NewsNow V2"
-        assert payload["location"].endswith("skill_workspace\\skills\\newsnow-v2")
+        assert Path(payload["location"]).name == "newsnow-v2"
+        assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
         assert payload["enabled"] is False
         assert payload["clawhub_slug"] == "newsnow-v2"

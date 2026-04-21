@@ -72,6 +72,11 @@ export interface RawToolPreview {
   display_name: string
   summary: string
   preview: string
+  truncated: boolean
+}
+
+export interface RawToolPreviewDetail extends RawToolPreview {
+  full_preview: string
 }
 
 export interface TradeDetail {
@@ -242,6 +247,8 @@ export interface ChatResponse {
 export interface ChatSession {
   id: number
   title: string
+  kind?: string
+  slug?: string | null
   created_at: string
   updated_at: string
   last_message_at: string | null
@@ -250,6 +257,28 @@ export interface ChatSession {
 
 export interface ChatSessionMessagesPayload {
   session: ChatSession
+  messages: ChatMessage[]
+  next_before_id: number | null
+  has_more: boolean
+}
+
+export interface PersistentSession {
+  id: number
+  title: string
+  kind: string
+  slug: string | null
+  created_at: string
+  updated_at: string
+  last_message_at: string | null
+  message_count: number
+  archived_summary: string | null
+  summary_revision: number
+  last_compacted_message_id: number | null
+  last_compacted_run_id: number | null
+}
+
+export interface PersistentSessionMessagesPayload {
+  session: PersistentSession
   messages: ChatMessage[]
   next_before_id: number | null
   has_more: boolean

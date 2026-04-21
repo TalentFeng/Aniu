@@ -11,12 +11,21 @@
               <div class="panel-head-actions">
                 <button
                   class="button ghost small soft-header-button overview-refresh-button"
-                  :class="{ 'is-loading': manualRunning }"
+                  :class="{ 'is-loading': manualRunning && activeManualAction === 'analysis' }"
                   :disabled="manualRunning"
                   :title="manualRunButtonTitle"
                   @click="handleManualRun"
                 >
-                  {{ manualRunning ? '执行中…' : '手动执行' }}
+                  {{ manualRunning && activeManualAction === 'analysis' ? '执行中…' : '执行分析' }}
+                </button>
+                <button
+                  class="button ghost small soft-header-button overview-refresh-button manual-trade-button"
+                  :class="{ 'is-loading': manualRunning && activeManualAction === 'trade' }"
+                  :disabled="manualRunning"
+                  :title="manualTradeButtonTitle"
+                  @click="handleManualTrade"
+                >
+                  {{ manualRunning && activeManualAction === 'trade' ? '执行中…' : '执行交易' }}
                 </button>
               </div>
             </div>
@@ -25,20 +34,9 @@
 
             <div class="runs-container">
               <!-- 今日运行 - 方块网格 -->
-              <div class="run-group" v-if="todayRuns.length || todaySuccessCount || todayFailedCount || livePlaceholderVisible">
+              <div class="run-group" v-if="todayRuns.length || livePlaceholderVisible">
                 <div class="group-label">
                   <span class="label-text">今日</span>
-                  <div class="group-label-meta">
-                    <span class="run-summary-text run-summary-success">成功{{ todaySuccessCount }}次</span>
-                    <button
-                      type="button"
-                      class="run-summary-text run-summary-failed"
-                      :class="{ 'is-active': showFailedRuns }"
-                      @click="toggleFailedRuns"
-                    >
-                      失败{{ todayFailedCount }}次
-                    </button>
-                  </div>
                 </div>
                 <div class="run-grid" v-if="todayRuns.length || livePlaceholderVisible">
                   <div
@@ -47,23 +45,23 @@
                     :class="{ active: liveFocused }"
                     @click="focusLiveCard"
                   >
+                    <div class="run-card-status dot-running"></div>
                     <div class="run-card-type">{{ liveRunTypeLabel }}</div>
                     <div class="run-card-time">{{ formatShortTime(liveStartedAtIso) }}</div>
                     <div class="run-card-duration">{{ liveElapsed }}</div>
-                    <div class="run-card-status dot-running"></div>
                   </div>
-                  <div
-                    v-for="run in todayRuns"
-                     :key="run.id"
-                     class="run-card"
-                     :class="{ active: isTodayRunActive(run.id), 'live-run-card': isTodayRunLive(run.id) }"
-                     @click="handleTodayRunSelect(run.id)"
-                   >
-                    <div class="run-card-type">{{ run.analysisType }}</div>
-                    <div class="run-card-time">{{ formatShortTime(run.startTime) }}</div>
-                    <div class="run-card-duration">{{ run.duration }}</div>
+                   <div
+                      v-for="run in todayRuns"
+                       :key="run.id"
+                       class="run-card"
+                       :class="{ active: isTodayRunActive(run.id), 'live-run-card': isTodayRunLive(run.id) }"
+                       @click="handleTodayRunSelect(run.id)"
+                     >
                      <div class="run-card-status" :class="isTodayRunLive(run.id) ? 'dot-running' : statusTone(run.status)"></div>
-                   </div>
+                     <div class="run-card-type">{{ run.analysisType }}</div>
+                     <div class="run-card-time">{{ formatShortTime(run.startTime) }}</div>
+                     <div class="run-card-duration">{{ run.duration }}</div>
+                    </div>
                 </div>
                 <div v-else class="run-grid-empty">
                   今日暂无可展示的运行记录。
@@ -94,17 +92,17 @@
                 </div>
                 <div class="run-grid" v-if="historyRuns.length">
                   <div 
-                    v-for="run in historyRuns" 
-                     :key="run.id"
-                     class="run-card"
-                     :class="{ active: !liveFocused && selectedRun?.id === run.id }"
-                     @click="handleSelectRun(run.id, historyRuns)"
-                   >
-                    <div class="run-card-type">{{ run.analysisType }}</div>
-                    <div class="run-card-time">{{ formatShortTime(run.startTime) }}</div>
-                    <div class="run-card-duration">{{ run.duration }}</div>
-                    <div class="run-card-status" :class="statusTone(run.status)"></div>
-                  </div>
+                     v-for="run in historyRuns" 
+                      :key="run.id"
+                      class="run-card"
+                      :class="{ active: !liveFocused && selectedRun?.id === run.id }"
+                      @click="handleSelectRun(run.id, historyRuns)"
+                    >
+                     <div class="run-card-status" :class="statusTone(run.status)"></div>
+                     <div class="run-card-type">{{ run.analysisType }}</div>
+                     <div class="run-card-time">{{ formatShortTime(run.startTime) }}</div>
+                     <div class="run-card-duration">{{ run.duration }}</div>
+                   </div>
                 </div>
                 <div v-if="selectedDate && !historyRuns.length" class="run-grid-empty">
                   该日期没有找到运行记录，请切换日期后重试。
@@ -119,6 +117,16 @@
               <div class="head-main">
                 <h2>分析详情</h2>
                 <p class="section-kicker">Analysis Detail</p>
+              </div>
+              <div v-if="selectedRun && !liveVisible" class="panel-head-actions">
+                <button
+                  type="button"
+                  class="button ghost small soft-header-button overview-refresh-button"
+                  title="删除当前任务"
+                  @click="handleDeleteRun(selectedRun.id)"
+                >
+                  删除任务
+                </button>
               </div>
             </div>
 
@@ -235,16 +243,16 @@
                   >
                     {{ liveOutputText }}
                   </div>
-                  <div
-                    v-else-if="liveVisible"
-                    ref="liveOutputRef"
-                    class="markdown-content live-markdown-content"
-                    @scroll="handleLiveOutputScroll"
-                    v-html="liveOutputHtml"
-                  ></div>
-                  <div v-else-if="activePreview" class="raw-output-content">
-                    {{ activePreview.preview }}
-                  </div>
+                   <div
+                     v-else-if="liveVisible"
+                     ref="liveOutputRef"
+                     class="markdown-content live-markdown-content"
+                     @scroll="handleLiveOutputScroll"
+                     v-html="liveOutputHtml"
+                   ></div>
+                   <div v-else-if="activePreview" class="raw-output-content" :class="{ 'is-loading': activePreviewLoading }">
+                     {{ activePreviewText }}
+                   </div>
                  <div v-else-if="renderedOutputLoading" class="detail-empty-state">
                    正在渲染分析输出...
                  </div>
@@ -303,11 +311,8 @@ const store = useAppStore()
 const {
   selectedRun,
   selectedRunLoading,
-  showFailedRuns,
   todayRuns,
   historyRuns,
-  todaySuccessCount,
-  todayFailedCount,
   selectedDate,
   errorMessage: analysisError,
   renderedOutputHtml,
@@ -315,11 +320,12 @@ const {
   loadInitialRuns,
   selectRun,
   refreshRunDetail,
+  ensureRawToolPreview,
   loadHistoryRuns,
-  toggleFailedRuns,
 } = useAnalysisRuns({
   listRunsPage: api.listRunsPage,
   loadRunDetail: store.loadRunDetail,
+  loadRawToolPreview: api.getRunRawToolPreview,
 })
 
 onMounted(() => {
@@ -343,6 +349,8 @@ const {
   pendingPostRunId,
 } = runStream
 
+const activeManualAction = ref<'analysis' | 'trade' | null>(null)
+
 const livePlaceholderVisible = computed(() => {
   if (!liveActive.value) return false
   if (liveRunId.value === null) return true
@@ -362,30 +370,104 @@ const manualRunTypeText = computed(() => {
   return match?.run_type === 'trade' ? '交易任务' : '分析任务'
 })
 
+const tradeScheduleId = computed(() => {
+  const match = store.schedules.find((item) => item.run_type === 'trade')
+  return match?.id ?? null
+})
+
+const manualTradeRunTypeText = computed(() => '交易任务')
+
 const manualRunButtonTitle = computed(() =>
   preMarketScheduleId.value === null
     ? '未找到盘前分析任务，将使用默认调度执行'
     : '手动执行一次盘前分析',
 )
 
-async function handleManualRun() {
+const manualTradeButtonTitle = computed(() =>
+  tradeScheduleId.value === null
+    ? '未找到交易任务，将使用默认手动交易模板执行'
+    : '手动执行一次交易任务',
+)
+
+async function startManualRun(options: {
+  scheduleId?: number
+  runType?: 'analysis' | 'trade'
+  action: 'analysis' | 'trade'
+  runTypeLabel: string
+}) {
   if (manualRunning.value) return
   const startedAt = Date.now()
   manualRunning.value = true
+  activeManualAction.value = options.action
   liveFocused.value = true
   try {
-    const { run_id } = await api.runNowStream(preMarketScheduleId.value ?? undefined)
+    const { run_id } = await api.runNowStream(options.scheduleId, options.runType)
     runStream.start(run_id, {
       startedAt,
-      runTypeLabel: manualRunTypeText.value,
+      runTypeLabel: options.runTypeLabel,
     }).catch((err) => {
       console.error('[TasksView] stream start failed', err)
     })
   } catch (error) {
     console.error('[TasksView] manual run failed', error)
     manualRunning.value = false
+    activeManualAction.value = null
     liveFocused.value = false
   }
+}
+
+async function handleManualRun() {
+  await startManualRun({
+    scheduleId: preMarketScheduleId.value ?? undefined,
+    action: 'analysis',
+    runTypeLabel: manualRunTypeText.value,
+  })
+}
+
+async function handleManualTrade() {
+  await startManualRun({
+    scheduleId: tradeScheduleId.value ?? undefined,
+    runType: tradeScheduleId.value == null ? 'trade' : undefined,
+    action: 'trade',
+    runTypeLabel: manualTradeRunTypeText.value,
+  })
+}
+
+async function handleDeleteRun(runId: number) {
+  const confirmed = window.confirm(`确定删除任务 #${runId} 吗？`)
+  if (!confirmed) return
+
+  try {
+    await api.deleteRun(runId)
+  } catch (error) {
+    const message = (error as Error).message || '删除任务失败'
+    if (message.includes('运行中的任务不可删除')) {
+      const forceConfirmed = window.confirm(
+        `任务 #${runId} 仍显示为进行中。若它其实已经卡死，可以强制删除。是否继续？`,
+      )
+      if (!forceConfirmed) return
+      try {
+        await api.deleteRun(runId, true)
+      } catch (forceError) {
+        console.error('[TasksView] force delete run failed', forceError)
+        window.alert((forceError as Error).message || '强制删除任务失败')
+        return
+      }
+    } else {
+      console.error('[TasksView] delete run failed', error)
+      window.alert(message)
+      return
+    }
+  }
+
+  if (selectedRun.value?.id === runId) {
+    liveFocused.value = false
+  }
+  await Promise.all([
+    loadInitialRuns({ syncSelection: true }),
+    selectedDate.value ? loadHistoryRuns() : Promise.resolve(),
+    store.refreshAfterRunCompletion(),
+  ])
 }
 
 function focusLiveCard() {
@@ -431,6 +513,9 @@ async function reconcileFinishedRun() {
 watch(
   () => runStream.state.status,
   (status) => {
+    if (status !== 'connecting' && status !== 'running') {
+      activeManualAction.value = null
+    }
     if (status === 'completed' || status === 'failed') {
       void reconcileFinishedRun()
     }
@@ -453,6 +538,8 @@ onBeforeUnmount(() => {
 
 const historyDateInput = ref<HTMLInputElement | null>(null)
 const activePreviewIndex = ref<number | null>(null)
+const activePreviewLoading = ref(false)
+const activePreviewError = ref('')
 const apiListRef = ref<HTMLElement | null>(null)
 const tradeListRef = ref<HTMLElement | null>(null)
 const liveOutputRef = ref<HTMLElement | null>(null)
@@ -611,6 +698,16 @@ const activePreview = computed(() => {
   return selectedRun.value.rawToolPreviews.find((item) => item.preview_index === activePreviewIndex.value) ?? null
 })
 
+const activePreviewText = computed(() => {
+  if (activePreviewError.value) {
+    return activePreviewError.value
+  }
+  if (activePreviewLoading.value && activePreview.value?.truncated) {
+    return '正在加载完整原文...'
+  }
+  return activePreview.value?.preview ?? ''
+})
+
 const historyDateDisplay = computed(() => {
   if (!selectedDate.value) {
     return '年/月/日'
@@ -648,15 +745,49 @@ function handleSelectRun(runId: number, runs: typeof todayRuns.value) {
   void selectRun(target, { force: target.id === liveRunId.value })
 }
 
-function focusPreview(index: number | null) {
+async function focusPreview(index: number | null) {
   if (typeof index !== 'number') {
     return
   }
-  activePreviewIndex.value = activePreviewIndex.value === index ? null : index
+
+  if (activePreviewIndex.value === index) {
+    clearPreviewFocus()
+    return
+  }
+
+  activePreviewIndex.value = index
+  activePreviewError.value = ''
+
+  const runId = selectedRun.value?.id
+  if (typeof runId !== 'number') {
+    return
+  }
+
+  const preview = selectedRun.value?.rawToolPreviews.find((item) => item.preview_index === index)
+  if (!preview || !preview.truncated) {
+    activePreviewLoading.value = false
+    return
+  }
+
+  activePreviewLoading.value = true
+  try {
+    await ensureRawToolPreview(runId, index)
+  } catch (error) {
+    console.error('[TasksView] raw preview load failed', error)
+    if (activePreviewIndex.value === index) {
+      activePreviewError.value = (error as Error).message || '完整原文加载失败'
+    }
+  } finally {
+    if (activePreviewIndex.value === index) {
+      activePreviewLoading.value = false
+    }
+  }
 }
 
 function clearPreviewFocus() {
   activePreviewIndex.value = null
+  activePreviewLoading.value = false
+  activePreviewError.value = ''
 }
 
 function isNearBottom(element: HTMLElement) {
@@ -774,7 +905,7 @@ function handleKeydown(event: KeyboardEvent) {
 watch(
   () => selectedRun.value?.id,
   () => {
-    activePreviewIndex.value = null
+    clearPreviewFocus()
   },
   { immediate: true },
 )
@@ -849,6 +980,10 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.manual-trade-button {
+  margin-left: 5px;
+}
+
 .compact-item-button {
   width: 100%;
   display: flex;

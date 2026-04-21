@@ -21,6 +21,12 @@ class AppSettingsBase(BaseModel):
     llm_api_key: str | None = Field(default=None, max_length=512)
     llm_model: str = Field(default="gpt-4o-mini", max_length=128)
     system_prompt: str = Field(max_length=20000)
+    automation_session_id: int | None = None
+    automation_context_window_tokens: int | None = Field(default=65536, ge=4096)
+    automation_target_prompt_tokens: int | None = Field(default=24000, ge=1024)
+    automation_recent_message_limit: int = Field(default=24, ge=4, le=200)
+    automation_enable_auto_compaction: bool = True
+    automation_idle_summary_hours: int = Field(default=12, ge=1, le=168)
 
 
 class AppSettingsRead(AppSettingsBase):
@@ -130,6 +136,11 @@ class RawToolPreviewRead(BaseModel):
     display_name: str
     summary: str
     preview: str
+    truncated: bool = False
+
+
+class RawToolPreviewDetailRead(RawToolPreviewRead):
+    full_preview: str
 
 
 class TradeDetailRead(BaseModel):
@@ -153,7 +164,13 @@ class RunSummaryRead(BaseModel):
     id: int
     trigger_source: str
     run_type: str
+    schedule_id: int | None = None
     schedule_name: str | None = None
+    chat_session_id: int | None = None
+    prompt_message_id: int | None = None
+    response_message_id: int | None = None
+    context_summary_version: int | None = None
+    context_tokens_estimate: int | None = None
     status: str
     analysis_summary: str | None = None
     error_message: str | None = None
@@ -326,8 +343,14 @@ class ChatResponse(BaseModel):
 
 class ChatStreamRequest(BaseModel):
     session_id: int = Field(ge=1)
-    content: str = Field(min_length=1, max_length=50000)
+    content: str = Field(default="", max_length=50000)
     attachment_ids: list[int] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_non_empty_message(self) -> "ChatStreamRequest":
+        if self.content.strip() or self.attachment_ids:
+            return self
+        raise ValueError("content 和 attachment_ids 至少要提供一项。")
 
 
 class ChatSessionRead(BaseModel):
@@ -335,6 +358,8 @@ class ChatSessionRead(BaseModel):
 
     id: int
     title: str
+    kind: str = "user"
+    slug: str | None = None
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime | None = None
@@ -362,6 +387,30 @@ class ChatMessageRead(BaseModel):
 
 class ChatSessionMessagesPageRead(BaseModel):
     session: ChatSessionRead
+    messages: list[ChatMessageRead] = Field(default_factory=list)
+    next_before_id: int | None = None
+    has_more: bool = False
+
+
+class PersistentSessionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    kind: str = "automation"
+    slug: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
+    archived_summary: str | None = None
+    summary_revision: int = 0
+    last_compacted_message_id: int | None = None
+    last_compacted_run_id: int | None = None
+
+
+class PersistentSessionMessagesPageRead(BaseModel):
+    session: PersistentSessionRead
     messages: list[ChatMessageRead] = Field(default_factory=list)
     next_before_id: int | None = None
     has_more: bool = False

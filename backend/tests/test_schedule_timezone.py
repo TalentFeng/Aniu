@@ -266,7 +266,7 @@ def test_execute_run_failure_advances_schedule_window(monkeypatch, tmp_path) -> 
     )
     monkeypatch.setattr(
         aniu_service_module.llm_service,
-        "run_agent",
+        "run_agent_with_messages",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     monkeypatch.setattr(
@@ -348,7 +348,7 @@ def test_execute_run_failure_stops_retry_after_third_retry(monkeypatch, tmp_path
     )
     monkeypatch.setattr(
         aniu_service_module.llm_service,
-        "run_agent",
+        "run_agent_with_messages",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     monkeypatch.setattr(
@@ -416,8 +416,8 @@ def test_manual_failure_does_not_increment_retry_count(monkeypatch, tmp_path) ->
     )
     monkeypatch.setattr(
         aniu_service_module.llm_service,
-        "run_agent",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        "run_agent_with_messages",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     monkeypatch.setattr(
         aniu_service_module,
@@ -576,8 +576,8 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
         def close(self) -> None:
             pass
 
-    def fake_run_agent(settings, client):
-        del settings, client
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del app_settings, client, messages, emit
         return (
             {
                 "final_answer": "执行两笔交易",
@@ -635,16 +635,10 @@ def test_execute_run_rolls_back_partial_trade_orders_when_order_persist_fails(
             yield db
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
-    monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
     monkeypatch.setattr(
-        aniu_service_module.aniu_service,
-        "_prefetch_account_tool_calls",
-        lambda **kwargs: [],
-    )
-    monkeypatch.setattr(
-        aniu_service_module.aniu_service,
-        "_build_prefetched_account_context",
-        lambda tool_calls: None,
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
     )
     monkeypatch.setattr(
         aniu_service_module.aniu_service,
@@ -1018,13 +1012,12 @@ def test_recent_account_snapshot_merges_balance_positions_and_orders_from_runs(
     assert orders == {"data": {"rows": [{"orderId": "A-1"}]}}
 
 
-def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_path) -> None:
+def test_execute_run_does_not_prefetch_account_before_agent(monkeypatch, tmp_path) -> None:
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
 
     from app.services import aniu_service as aniu_service_module
 
-    prefetched_names: list[str] = []
     captured_task_prompt: dict[str, str] = {}
 
     monkeypatch.setattr(
@@ -1051,11 +1044,11 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
             pass
 
         def get_balance(self) -> dict[str, object]:
-            prefetched_names.append("mx_get_balance")
+            raise AssertionError("run path should not prefetch balance")
             return {"data": {"totalAsset": 100000, "balanceActual": 95000}}
 
         def get_positions(self) -> dict[str, object]:
-            prefetched_names.append("mx_get_positions")
+            raise AssertionError("run path should not prefetch positions")
             return {
                 "data": {
                     "rows": [
@@ -1070,7 +1063,7 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
             }
 
         def get_orders(self) -> dict[str, object]:
-            prefetched_names.append("mx_get_orders")
+            raise AssertionError("run path should not prefetch orders")
             return {
                 "data": {
                     "rows": [
@@ -1088,9 +1081,10 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
         def close(self) -> None:
             pass
 
-    def fake_run_agent(settings, client):
-        del client
-        captured_task_prompt["value"] = settings.task_prompt
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del client, emit
+        captured_task_prompt["value"] = app_settings.task_prompt
+        captured_task_prompt["messages"] = messages
         return (
             {
                 "final_answer": "保持观察。",
@@ -1102,17 +1096,21 @@ def test_execute_run_prefetches_account_triplet_before_agent(monkeypatch, tmp_pa
         )
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
-    monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
 
     run = aniu_service.execute_run(trigger_source="manual")
 
     _reset_db_state()
 
-    assert prefetched_names == ["mx_get_balance", "mx_get_positions", "mx_get_orders"]
-    assert "系统已在本轮开始前预取账户快照" in captured_task_prompt["value"]
+    assert captured_task_prompt["value"] == "请分析当前账户。"
+    assert any(msg.get("role") == "user" for msg in captured_task_prompt["messages"])
     assert run.skill_payloads is not None
-    assert run.skill_payloads.get("prefetched_tool_calls")
-    assert run.skill_payloads.get("prefetched_context")
+    assert run.skill_payloads.get("prefetched_tool_calls") in (None, [])
+    assert run.skill_payloads.get("prefetched_context") in (None, "")
 
 
 def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_path) -> None:
@@ -1149,9 +1147,9 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
         def close(self) -> None:
             pass
 
-    def fake_run_agent(settings, client, emit=None):
-        del client
-        captured["task_prompt"] = settings.task_prompt
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del client, messages
+        captured["task_prompt"] = app_settings.task_prompt
         captured["emit_is_callable"] = callable(emit)
         return (
             {
@@ -1165,16 +1163,10 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
 
     monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
     monkeypatch.setattr(
-        aniu_service_module.aniu_service,
-        "_prefetch_account_tool_calls",
-        lambda **kwargs: [],
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
     )
-    monkeypatch.setattr(
-        aniu_service_module.aniu_service,
-        "_build_prefetched_account_context",
-        lambda tool_calls: None,
-    )
-    monkeypatch.setattr(aniu_service_module.llm_service, "run_agent", fake_run_agent)
 
     run = aniu_service.execute_run(trigger_source="manual")
 
@@ -1183,6 +1175,71 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
     assert run.status == "completed"
     assert captured["task_prompt"] == "请分析当前账户。"
     assert captured["emit_is_callable"] is True
+
+
+def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请分析当前账户。",
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del client, messages, emit
+        captured["run_type"] = app_settings.run_type
+        captured["task_prompt"] = app_settings.task_prompt
+        return (
+            {
+                "final_answer": "执行交易。",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+
+    run = aniu_service.execute_run(trigger_source="manual", manual_run_type="trade")
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert run.run_type == "trade"
+    assert captured["run_type"] == "trade"
+    assert "生成交易决策" in str(captured["task_prompt"])
 
 
 def test_daily_profit_trade_date_falls_back_to_previous_trading_day_on_weekend(
