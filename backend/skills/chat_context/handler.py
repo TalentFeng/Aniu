@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from app.db.database import session_scope
 from app.schemas.aniu import RunDetailRead, RunSummaryRead
 from app.skills.base import BaseSkill
+from app.skills.context import get_chat_context_ports
 
 
 def _bool_arg(value: Any) -> bool:
@@ -167,10 +167,8 @@ class Skill(BaseSkill):
     ]
 
     def do_chat_get_account_summary(self, *, arguments, context):
-        del context
-        from app.services.aniu_service import aniu_service
-
-        overview = aniu_service.get_account_overview(
+        ports = get_chat_context_ports(context)
+        overview = ports.get_account_overview(
             force_refresh=_bool_arg(arguments.get("force_refresh", False))
         )
         account = {
@@ -200,11 +198,9 @@ class Skill(BaseSkill):
         }
 
     def do_chat_get_positions(self, *, arguments, context):
-        del context
-        from app.services.aniu_service import aniu_service
-
+        ports = get_chat_context_ports(context)
         limit = _clamp_int(arguments.get("limit"), default=20, minimum=1, maximum=100)
-        overview = aniu_service.get_account_overview(
+        overview = ports.get_account_overview(
             force_refresh=_bool_arg(arguments.get("force_refresh", False))
         )
         positions = list(overview.get("positions") or [])
@@ -220,11 +216,9 @@ class Skill(BaseSkill):
         }
 
     def do_chat_get_orders(self, *, arguments, context):
-        del context
-        from app.services.aniu_service import aniu_service
-
+        ports = get_chat_context_ports(context)
         limit = _clamp_int(arguments.get("limit"), default=20, minimum=1, maximum=100)
-        overview = aniu_service.get_account_overview(
+        overview = ports.get_account_overview(
             force_refresh=_bool_arg(arguments.get("force_refresh", False))
         )
         orders = list(overview.get("orders") or [])
@@ -240,8 +234,7 @@ class Skill(BaseSkill):
         }
 
     def do_chat_list_runs(self, *, arguments, context):
-        del context
-        from app.services.aniu_service import aniu_service
+        ports = get_chat_context_ports(context)
 
         run_date = None
         date_text = str(arguments.get("date") or "").strip()
@@ -261,8 +254,8 @@ class Skill(BaseSkill):
         if before_id is not None:
             before_id = _clamp_int(before_id, default=1, minimum=1, maximum=10**9)
 
-        with session_scope() as db:
-            page = aniu_service.list_runs_page(
+        with ports.session_scope_factory() as db:
+            page = ports.list_runs_page(
                 db,
                 limit=limit,
                 run_date=run_date,
@@ -286,8 +279,7 @@ class Skill(BaseSkill):
         }
 
     def do_chat_get_run_detail(self, *, arguments, context):
-        del context
-        from app.services.aniu_service import aniu_service
+        ports = get_chat_context_ports(context)
 
         run_id = arguments.get("run_id")
         try:
@@ -300,8 +292,8 @@ class Skill(BaseSkill):
             }
 
         include_tool_previews = _bool_arg(arguments.get("include_tool_previews", False))
-        with session_scope() as db:
-            run = aniu_service.get_run(db, run_id)
+        with ports.session_scope_factory() as db:
+            run = ports.get_run(db, run_id)
 
         if run is None:
             return {

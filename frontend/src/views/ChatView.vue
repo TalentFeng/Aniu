@@ -33,7 +33,6 @@
           :can-send="persistentSelected ? false : canSend"
           :error-message="persistentSelected ? persistentErrorMessage : errorMessage"
           :read-only="persistentSelected"
-          :summary-text="persistentSelected ? (persistentSession?.archived_summary ?? null) : null"
           :ensure-session-ready="ensureSessionReady"
           :load-older-messages="persistentSelected ? loadOlderPersistentMessages : loadOlderMessages"
           @submit="handleSubmit"
@@ -47,13 +46,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import ChatConversation from '@/components/chat/ChatConversation.vue'
 import ChatSessionSidebar from '@/components/chat/ChatSessionSidebar.vue'
 import { useChatSession } from '@/composables/useChatSession'
 import { useChatSessions } from '@/composables/useChatSessions'
 import { usePersistentSession } from '@/composables/usePersistentSession'
+import { useRunStream } from '@/composables/useRunStream'
 
 const {
   sessions,
@@ -95,8 +95,11 @@ const {
   loadSession: loadPersistentSession,
   loadOlderMessages: loadOlderPersistentMessages,
   refreshSummaryOnly: refreshPersistentSummaryOnly,
+  appendSystemMessage: appendPersistentSystemMessage,
   clear: clearPersistentSession,
 } = usePersistentSession()
+
+const runStream = useRunStream()
 
 const skipNextSessionLoad = ref(false)
 const persistentSelected = ref(false)
@@ -136,6 +139,17 @@ onMounted(async () => {
     restoreCurrentSession(true),
     refreshPersistentSummaryOnly(),
   ])
+})
+
+const disposeRunStreamListener = runStream.onEvent((event) => {
+  if (event.type !== 'context_compacted') {
+    return
+  }
+  const content = String(event.content || '').trim()
+  if (!content) {
+    return
+  }
+  appendPersistentSystemMessage(content, new Date().toISOString())
 })
 
 watch(currentSessionId, async (sessionId) => {
@@ -225,5 +239,9 @@ watch(persistentSelected, (selected) => {
   if (!selected) {
     clearPersistentSession()
   }
+})
+
+onBeforeUnmount(() => {
+  disposeRunStreamListener()
 })
 </script>

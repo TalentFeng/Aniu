@@ -207,7 +207,11 @@ class SkillAdminService:
             "description": pkg.description,
             "location": str(pkg.path.resolve()),
             "source": pkg.source,
+            "role": getattr(pkg, "role", "standard"),
             "enabled": enabled,
+            "can_disable": bool(getattr(pkg, "can_disable", False)),
+            "can_delete": bool(getattr(pkg, "can_delete", False)),
+            "always_enabled": bool(getattr(pkg, "always_enabled", False)),
             "has_handler": pkg.skill is not None,
             "tool_names": sorted(pkg.tool_names()),
             "run_types": self._extract_run_types(pkg),
@@ -240,7 +244,11 @@ class SkillAdminService:
             "name": pkg.name,
             "description": pkg.description,
             "source": pkg.source,
+            "role": getattr(pkg, "role", "standard"),
             "enabled": enabled,
+            "can_disable": bool(getattr(pkg, "can_disable", False)),
+            "can_delete": bool(getattr(pkg, "can_delete", False)),
+            "always_enabled": bool(getattr(pkg, "always_enabled", False)),
         }
 
     def _sorted_packages(self) -> list[Any]:
@@ -259,7 +267,7 @@ class SkillAdminService:
         return [
             self._build_skill_list_item(
                 pkg,
-                enabled=(self._is_system_runtime(pkg) or pkg.id not in disabled_ids),
+                enabled=(pkg.always_enabled or pkg.id not in disabled_ids),
             )
             for pkg in packages
         ]
@@ -273,10 +281,10 @@ class SkillAdminService:
 
     def set_enabled(self, db: Session, *, skill_id: str, enabled: bool) -> dict[str, Any]:
         pkg = self._find_skill(skill_id)
-        if self._is_system_runtime(pkg):
+        if not getattr(pkg, "can_disable", False):
             if not enabled:
                 raise ValueError("System runtime skills cannot be disabled.")
-            return self._build_skill_info(pkg, enabled=True)
+            return self._build_skill_info(pkg, enabled=bool(getattr(pkg, "always_enabled", True)))
         disabled_ids = self._get_disabled_skill_ids(db)
         if enabled:
             disabled_ids.discard(pkg.id)
@@ -288,7 +296,7 @@ class SkillAdminService:
 
     def delete_skill(self, db: Session, *, skill_id: str) -> None:
         pkg = self._find_skill(skill_id)
-        if pkg.source != "workspace":
+        if not getattr(pkg, "can_delete", False):
             raise ValueError("Built-in skills cannot be deleted.")
 
         workspace_dir = _workspace_skills_dir().resolve()
@@ -313,7 +321,7 @@ class SkillAdminService:
         return [
             self._build_skill_list_item(
                 pkg,
-                enabled=(self._is_system_runtime(pkg) or pkg.id not in disabled_ids),
+                enabled=(pkg.always_enabled or pkg.id not in disabled_ids),
             )
             for pkg in packages
         ]

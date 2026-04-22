@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from app.skills.base import BaseSkill
+from app.skills.context import get_skill_runtime_paths
 
 
 _DEFAULT_HTTP_TIMEOUT = 30.0
@@ -91,34 +92,23 @@ def _tool_error(
     return payload
 
 
-def _workspace_root() -> Path:
-    try:
-        from app.core.config import get_settings, get_skill_workspace_root
-
-        root = get_skill_workspace_root(get_settings())
-    except Exception:
-        root = Path.cwd() / "data" / "skill_workspace"
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
-
-
 def _builtin_skills_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _chat_uploads_root() -> Path:
-    try:
-        from app.core.config import get_runtime_data_dir, get_settings
-
-        root = get_runtime_data_dir(get_settings()) / "chat_uploads"
-    except Exception:
-        root = Path.cwd() / "data" / "chat_uploads"
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+def _runtime_paths(context: dict[str, Any]) -> tuple[Path, Path, Path]:
+    paths = get_skill_runtime_paths(context, builtin_skills_root=_builtin_skills_root().resolve())
+    return paths.workspace_root, paths.builtin_skills_root, paths.chat_uploads_root
 
 
-def _read_roots() -> list[Path]:
-    return [_workspace_root(), _builtin_skills_root().resolve(), _chat_uploads_root()]
+def _workspace_root(context: dict[str, Any]) -> Path:
+    workspace_root, _, _ = _runtime_paths(context)
+    return workspace_root
+
+
+def _read_roots(context: dict[str, Any]) -> list[Path]:
+    workspace_root, builtin_root, chat_uploads_root = _runtime_paths(context)
+    return [workspace_root, builtin_root, chat_uploads_root]
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -129,27 +119,28 @@ def _is_under(path: Path, root: Path) -> bool:
         return False
 
 
-def _resolve_read_path(path: str) -> Path:
+def _resolve_read_path(path: str, *, context: dict[str, Any]) -> Path:
     raw = Path(str(path or "").strip()).expanduser()
     if not str(raw):
         raise RuntimeError("Missing path argument.")
 
-    candidates = [raw] if raw.is_absolute() else [_workspace_root() / raw]
+    candidates = [raw] if raw.is_absolute() else [_workspace_root(context) / raw]
     for candidate in candidates:
         resolved = candidate.resolve()
-        for root in _read_roots():
+        for root in _read_roots(context):
             if _is_under(resolved, root):
                 return resolved
     raise RuntimeError(f"Path is outside the readable skill roots: {path}")
 
 
-def _resolve_workspace_path(path: str) -> Path:
+def _resolve_workspace_path(path: str, *, context: dict[str, Any]) -> Path:
     raw = Path(str(path or "").strip()).expanduser()
     if not str(raw):
         raise RuntimeError("Missing path argument.")
-    candidate = raw if raw.is_absolute() else _workspace_root() / raw
+    workspace_root = _workspace_root(context)
+    candidate = raw if raw.is_absolute() else workspace_root / raw
     resolved = candidate.resolve()
-    if not _is_under(resolved, _workspace_root()):
+    if not _is_under(resolved, workspace_root):
         raise RuntimeError(f"Path is outside skill workspace: {path}")
     return resolved
 
@@ -606,7 +597,7 @@ class Skill(BaseSkill):
         except Exception as exc:  # noqa: BLE001
             return _tool_error("http_post", str(exc))
 
-    def _read_file_impl(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _read_file_impl(self, tool_name: str, arguments: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
         path = str(arguments.get("path") or "").strip()
         if not path:
             return _tool_error(tool_name, "Missing path argument.")
@@ -619,7 +610,7 @@ class Skill(BaseSkill):
             default=_DEFAULT_READ_LIMIT,
         )
         try:
-            target = _resolve_read_path(path)
+            target = _resolve_read_path(path, context=context)
             if not target.exists():
                 return _tool_error(tool_name, f"File not found: {path}")
             if not target.is_file():
@@ -680,10 +671,9 @@ class Skill(BaseSkill):
             return _tool_error(tool_name, str(exc))
 
     def do_read_file(self, *, arguments, context):
-        del context
-        return self._read_file_impl("read_file", arguments)
+        return self._read_file_impl("read_file", arguments, context=context)
 
-    def _write_file_impl(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _write_file_impl(self, tool_name: str, arguments: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
         path = str(arguments.get("path") or "").strip()
         if not path:
             return _tool_error(tool_name, "Missing path argument.")
@@ -693,7 +683,7 @@ class Skill(BaseSkill):
         if mode not in {"overwrite", "append", "prepend"}:
             return _tool_error(tool_name, "mode must be overwrite, append, or prepend.")
         try:
-            target = _resolve_workspace_path(path)
+            target = _resolve_workspace_path(path, context=context)
             target.parent.mkdir(parents=True, exist_ok=True)
             new_content = str(arguments.get("content"))
             if mode == "overwrite" or not target.exists():
@@ -717,11 +707,9 @@ class Skill(BaseSkill):
             return _tool_error(tool_name, str(exc))
 
     def do_write_file(self, *, arguments, context):
-        del context
-        return self._write_file_impl("write_file", arguments)
+        return self._write_file_impl("write_file", arguments, context=context)
 
     def do_edit_file(self, *, arguments, context):
-        del context
         path = str(arguments.get("path") or "").strip()
         if not path:
             return _tool_error("edit_file", "Missing path argument.")
@@ -733,7 +721,7 @@ class Skill(BaseSkill):
             return _tool_error("edit_file", "Missing new_text argument.")
         replace_all = bool(arguments.get("replace_all", False))
         try:
-            target = _resolve_workspace_path(path)
+            target = _resolve_workspace_path(path, context=context)
             if not target.exists() or not target.is_file():
                 return _tool_error("edit_file", f"File not found: {path}")
             content = target.read_text(encoding="utf-8", errors="replace")
@@ -759,10 +747,10 @@ class Skill(BaseSkill):
         except Exception as exc:  # noqa: BLE001
             return _tool_error("edit_file", str(exc))
 
-    def _list_dir_impl(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _list_dir_impl(self, tool_name: str, arguments: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
         raw_path = str(arguments.get("path") or ".").strip() or "."
         try:
-            target = _resolve_read_path(raw_path)
+            target = _resolve_read_path(raw_path, context=context)
             if not target.exists():
                 return _tool_error(tool_name, f"Path not found: {raw_path}")
             if target.is_file():
@@ -800,11 +788,9 @@ class Skill(BaseSkill):
             return _tool_error(tool_name, str(exc))
 
     def do_list_dir(self, *, arguments, context):
-        del context
-        return self._list_dir_impl("list_dir", arguments)
+        return self._list_dir_impl("list_dir", arguments, context=context)
 
     def do_glob(self, *, arguments, context):
-        del context
         pattern = str(arguments.get("pattern") or "").strip()
         if not pattern:
             return _tool_error("glob", "Missing pattern argument.")
@@ -822,7 +808,7 @@ class Skill(BaseSkill):
         offset = max(int(arguments.get("offset") or 0), 0)
 
         try:
-            root = _resolve_read_path(raw_path)
+            root = _resolve_read_path(raw_path, context=context)
             if not root.exists():
                 return _tool_error("glob", f"Path not found: {raw_path}")
             if not root.is_dir():
@@ -870,7 +856,6 @@ class Skill(BaseSkill):
             return _tool_error("glob", str(exc))
 
     def do_grep(self, *, arguments, context):
-        del context
         pattern = str(arguments.get("pattern") or "").strip()
         if not pattern:
             return _tool_error("grep", "Missing pattern argument.")
@@ -905,7 +890,7 @@ class Skill(BaseSkill):
             return _tool_error("grep", f"Invalid regex: {exc}")
 
         try:
-            target = _resolve_read_path(raw_path)
+            target = _resolve_read_path(raw_path, context=context)
             if not target.exists():
                 return _tool_error("grep", f"Path not found: {raw_path}")
             if not (target.is_dir() or target.is_file()):
@@ -1046,14 +1031,14 @@ class Skill(BaseSkill):
         except Exception as exc:  # noqa: BLE001
             return _tool_error("grep", str(exc))
 
-    def _exec_impl(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _exec_impl(self, tool_name: str, arguments: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
         command = str(arguments.get("command") or "").strip()
         if not command:
             return _tool_error(tool_name, "Missing command argument.")
         timeout = _safe_timeout(arguments.get("timeout"))
         cwd_raw = str(arguments.get("cwd") or "").strip()
         try:
-            cwd = _resolve_workspace_path(cwd_raw) if cwd_raw else _workspace_root()
+            cwd = _resolve_workspace_path(cwd_raw, context=context) if cwd_raw else _workspace_root(context)
             cwd.mkdir(parents=True, exist_ok=True)
             proc = subprocess.run(  # noqa: S602
                 command,
@@ -1091,8 +1076,7 @@ class Skill(BaseSkill):
             return _tool_error(tool_name, str(exc))
 
     def do_exec(self, *, arguments, context):
-        del context
-        return self._exec_impl("exec", arguments)
+        return self._exec_impl("exec", arguments, context=context)
 
     def do_web_search(self, *, arguments, context):
         del context

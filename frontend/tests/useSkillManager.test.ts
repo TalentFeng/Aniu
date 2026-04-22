@@ -10,7 +10,11 @@ function createSkillListItem(overrides: Partial<SkillListItem> = {}): SkillListI
     name: 'builtin_utils',
     description: 'desc',
     source: 'builtin',
+    role: 'runtime',
     enabled: true,
+    can_disable: false,
+    can_delete: false,
+    always_enabled: true,
     ...overrides,
   }
 }
@@ -39,7 +43,15 @@ test('loadSkills populates skill list and counters', async () => {
   const manager = useSkillManager({
     listSkills: async () => [
       createSkillListItem(),
-      createSkillListItem({ id: 'prompt-skill', source: 'workspace', enabled: false }),
+      createSkillListItem({
+        id: 'prompt-skill',
+        source: 'workspace',
+        role: 'standard',
+        enabled: false,
+        can_disable: true,
+        can_delete: true,
+        always_enabled: false,
+      }),
     ],
     importSkillHubSkill: async () => createSkill(),
     importSkillArchive: async () => createSkill(),
@@ -56,13 +68,13 @@ test('loadSkills populates skill list and counters', async () => {
   assert.equal(manager.workspaceCount.value, 1)
   assert.deepEqual(manager.installedOverview.value, {
     total: 2,
-    builtin: 1,
-    workspace: 1,
+    runtime: 1,
+    standard: 1,
   })
   assert.deepEqual(manager.enabledOverview.value, {
     total: 1,
-    builtin: 1,
-    workspace: 0,
+    runtime: 1,
+    standard: 0,
   })
 })
 
@@ -71,7 +83,11 @@ test('importFromSkillHub trims input and keeps imported skill disabled', async (
     id: 'newsnow-v2',
     name: 'NewsNow V2',
     source: 'workspace',
+    role: 'standard',
     enabled: false,
+    can_disable: true,
+    can_delete: true,
+    always_enabled: false,
     has_handler: false,
     compatibility_level: 'needs_attention',
     clawhub_slug: 'newsnow-v2',
@@ -104,7 +120,11 @@ test('importSkill prefers selected zip archive over SkillHub input', async () =>
     id: 'uploaded-skill',
     name: 'Uploaded Skill',
     source: 'workspace',
+    role: 'standard',
     enabled: false,
+    can_disable: true,
+    can_delete: true,
+    always_enabled: false,
   })
   const file = new File(['demo'], 'uploaded-skill.zip', { type: 'application/zip' })
   let archiveCalls = 0
@@ -177,20 +197,28 @@ test('toggleSkill keeps same-source skills in name order after disabling', async
       id: skillId,
       name: 'Alpha Skill',
       source: 'workspace',
+      role: 'standard',
       enabled: true,
+      can_disable: true,
+      can_delete: true,
+      always_enabled: false,
     }),
     disableSkill: async (skillId: string) => createSkill({
       id: skillId,
       name: 'Alpha Skill',
       source: 'workspace',
+      role: 'standard',
       enabled: false,
+      can_disable: true,
+      can_delete: true,
+      always_enabled: false,
     }),
     deleteSkill: async () => undefined,
   })
 
   manager.skills.value = [
-    createSkill({ id: 'alpha-skill', name: 'Alpha Skill', source: 'workspace', enabled: true }),
-    createSkill({ id: 'beta-skill', name: 'Beta Skill', source: 'workspace', enabled: true }),
+    createSkill({ id: 'alpha-skill', name: 'Alpha Skill', source: 'workspace', role: 'standard', enabled: true, can_disable: true, can_delete: true, always_enabled: false }),
+    createSkill({ id: 'beta-skill', name: 'Beta Skill', source: 'workspace', role: 'standard', enabled: true, can_disable: true, can_delete: true, always_enabled: false }),
   ]
 
   await manager.toggleSkill(manager.skills.value[0])
@@ -219,7 +247,7 @@ test('deleteSkill removes workspace skill', async () => {
 
   manager.skills.value = [
     createSkill(),
-    createSkill({ id: 'uploaded-skill', name: 'Uploaded Skill', source: 'workspace', enabled: false }),
+    createSkill({ id: 'uploaded-skill', name: 'Uploaded Skill', source: 'workspace', role: 'standard', enabled: false, can_disable: true, can_delete: true, always_enabled: false }),
   ]
 
   await manager.deleteSkill(manager.skills.value[1])

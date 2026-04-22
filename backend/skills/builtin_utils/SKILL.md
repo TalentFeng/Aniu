@@ -6,6 +6,7 @@ metadata:
     handler_module: skills.builtin_utils.handler
     run_types: [analysis, trade, chat]
     category: utility
+    role: runtime
 ---
 
 # 通用技能运行时

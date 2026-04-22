@@ -306,6 +306,37 @@ def test_chat_endpoint_returns_assistant_message(monkeypatch, tmp_path) -> None:
     get_settings.cache_clear()
 
 
+def test_settings_endpoint_updates_max_context_tokens(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        headers = _auth_headers(client)
+        response = client.put(
+            "/api/aniu/settings",
+            json={
+                "provider_name": "openai-compatible",
+                "mx_api_key": None,
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "sk-test",
+                "llm_model": "gpt-5.4",
+                "automation_context_window_tokens": 128000,
+                "system_prompt": "system prompt",
+                "automation_session_id": None,
+                "automation_recent_message_limit": 24,
+                "automation_enable_auto_compaction": True,
+                "automation_idle_summary_hours": 12,
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["llm_model"] == "gpt-5.4"
+    assert payload["automation_context_window_tokens"] == 128000
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_chat_endpoint_rejects_empty_messages(monkeypatch, tmp_path) -> None:
     with create_test_client(monkeypatch, tmp_path) as client:
         headers = _auth_headers(client)
@@ -414,6 +445,37 @@ def test_runtime_read_file_can_access_chat_upload_text_files(monkeypatch, tmp_pa
     get_settings.cache_clear()
 
 
+def test_runtime_read_file_uses_skill_runtime_paths_from_context(monkeypatch, tmp_path) -> None:
+    workspace_root = tmp_path / "custom_workspace"
+    builtin_root = tmp_path / "custom_builtin"
+    chat_uploads_root = tmp_path / "custom_uploads"
+    target = chat_uploads_root / "notes.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("alpha\nbeta\n", encoding="utf-8")
+
+    with create_test_client(monkeypatch, tmp_path):
+        result = skill_registry.execute_tool(
+            tool_name="read_file",
+            arguments={"path": str(target), "offset": 1, "limit": 20},
+            context={
+                "run_type": "chat",
+                "skill_runtime_paths": {
+                    "workspace_root": str(workspace_root),
+                    "builtin_skills_root": str(builtin_root),
+                    "chat_uploads_root": str(chat_uploads_root),
+                },
+            },
+        )
+
+    assert result["ok"] is True
+    assert "1| alpha" in result["result"]["content"]
+    assert "2| beta" in result["result"]["content"]
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_removed_runtime_aliases_are_no_longer_available(monkeypatch, tmp_path) -> None:
     with create_test_client(monkeypatch, tmp_path):
         result = skill_registry.execute_tool(
@@ -515,6 +577,64 @@ def test_mx_core_tools_can_execute_in_chat_without_prebuilt_client(
 
     assert result["ok"] is True
     assert captured["api_key"] == "mx-chat-key"
+    assert captured["tool_name"] == "mx_get_balance"
+    assert captured["entered"] is True
+    assert captured["exited"] is True
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_mx_core_tools_use_mx_client_config_from_context(monkeypatch, tmp_path) -> None:
+    from skills.mx_core import handler as mx_core_handler
+
+    captured: dict[str, object] = {}
+
+    class DummyMXClient:
+        def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+
+        def __enter__(self):
+            captured["entered"] = True
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            captured["exited"] = True
+
+    def fake_execute_tool(*, client, app_settings, tool_name, arguments):
+        captured["client"] = client
+        captured["tool_name"] = tool_name
+        captured["arguments"] = arguments
+        captured["task_prompt"] = getattr(app_settings, "task_prompt", None)
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "ok",
+            "result": {"connected": True},
+        }
+
+    monkeypatch.setattr(mx_core_handler, "MXClient", DummyMXClient)
+    monkeypatch.setattr(mx_core_handler.mx_skill_service, "execute_tool", fake_execute_tool)
+
+    with create_test_client(monkeypatch, tmp_path):
+        result = skill_registry.execute_tool(
+            tool_name="mx_get_balance",
+            arguments={},
+            context={
+                "run_type": "chat",
+                "app_settings": SimpleNamespace(mx_api_key="ignored-key", task_prompt=""),
+                "mx_client_config": {
+                    "api_key": "mx-context-key",
+                    "base_url": "https://mx.example.test/api",
+                },
+            },
+        )
+
+    assert result["ok"] is True
+    assert captured["api_key"] == "mx-context-key"
+    assert captured["base_url"] == "https://mx.example.test/api"
     assert captured["tool_name"] == "mx_get_balance"
     assert captured["entered"] is True
     assert captured["exited"] is True

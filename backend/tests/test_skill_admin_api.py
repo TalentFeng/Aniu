@@ -62,6 +62,10 @@ def test_skills_endpoint_lists_builtin_skills(monkeypatch, tmp_path) -> None:
     builtin_utils = next(item for item in payload if item["id"] == "builtin_utils")
     assert builtin_utils["name"] == "builtin_utils"
     assert builtin_utils["source"] == "builtin"
+    assert builtin_utils["role"] == "runtime"
+    assert builtin_utils["can_disable"] is False
+    assert builtin_utils["can_delete"] is False
+    assert builtin_utils["always_enabled"] is True
     assert "location" not in builtin_utils
     assert "support_files" not in builtin_utils
     assert "tool_names" not in builtin_utils
@@ -136,6 +140,8 @@ def test_system_runtime_skill_cannot_be_disabled(monkeypatch, tmp_path) -> None:
         assert response.status_code == 200
         builtin_utils = next(item for item in response.json() if item["id"] == "builtin_utils")
         assert builtin_utils["enabled"] is True
+        assert builtin_utils["can_disable"] is False
+        assert builtin_utils["always_enabled"] is True
 
     database_module._engine = None
     database_module._session_local = None
@@ -185,7 +191,11 @@ This skill should only appear in the prompt supplement after it is enabled.
         assert Path(payload["location"]).name == "fancy-skill"
         assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
+        assert payload["role"] == "standard"
         assert payload["enabled"] is False
+        assert payload["can_disable"] is True
+        assert payload["can_delete"] is True
+        assert payload["always_enabled"] is False
         assert payload["compatibility_level"] == "needs_attention"
 
         target_skill = (
@@ -285,7 +295,9 @@ This skill comes from a local zip file.
         assert payload["id"] == "uploaded-skill"
         assert payload["name"] == "Uploaded Skill"
         assert payload["source"] == "workspace"
+        assert payload["role"] == "standard"
         assert payload["enabled"] is False
+        assert payload["can_delete"] is True
 
         target_skill = (
             tmp_path / "skill_workspace" / "skills" / "uploaded-skill" / "SKILL.md"
@@ -368,6 +380,11 @@ Workspace skill beta.
             item["id"] for item in skills_response.json() if item["source"] == "workspace"
         ]
         assert workspace_ids[:2] == ["alpha-skill", "beta-skill"]
+
+        runtime_ids = [
+            item["id"] for item in skills_response.json() if item["role"] == "runtime"
+        ]
+        assert runtime_ids == ["builtin_utils"]
 
     database_module._engine = None
     database_module._session_local = None
@@ -483,6 +500,7 @@ SkillHub downloaded skill.
         assert Path(payload["location"]).name == "newsnow-v2"
         assert Path(payload["location"]).parent.name == "skills"
         assert payload["source"] == "workspace"
+        assert payload["role"] == "standard"
         assert payload["enabled"] is False
         assert payload["clawhub_slug"] == "newsnow-v2"
         assert payload["clawhub_version"] == "1.1.0"

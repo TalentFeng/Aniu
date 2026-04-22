@@ -27,6 +27,7 @@ from app.schemas.aniu import (
     ChatSessionRead,
     ChatStreamRequest,
 )
+from app.skills.providers import build_skill_context
 from app.services.llm_service import LLMStreamCancelled, llm_service
 
 
@@ -733,7 +734,10 @@ class ChatSessionService:
                     system_prompt=settings_snapshot.system_prompt,
                     messages=history_messages,
                     timeout_seconds=180,
-                    tool_context={"app_settings": settings_snapshot},
+                    tool_context=build_skill_context(
+                        run_type="chat",
+                        app_settings=settings_snapshot,
+                    ),
                     emit=_emit,
                     cancel_event=cancel_event,
                 )

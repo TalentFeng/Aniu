@@ -4,14 +4,11 @@ from typing import Any
 
 import httpx
 
-from app.core.config import get_settings
-
 
 class MXClient:
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
-        settings = get_settings()
-        self.api_key = api_key or settings.mx_apikey
-        self.base_url = (base_url or settings.mx_api_url).rstrip("/")
+        self.api_key = api_key
+        self.base_url = str(base_url or "https://mkapi2.dfcfs.com/finskillshub").rstrip("/")
         if not self.api_key:
             raise ValueError("未配置 MX_APIKEY，无法调用妙想接口。")
         self._client = httpx.Client(

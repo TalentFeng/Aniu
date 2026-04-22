@@ -81,6 +81,33 @@ export function usePersistentSession() {
     nextBeforeId.value = null
   }
 
+  function appendSystemMessage(content: string, createdAt?: string): void {
+    const normalized = String(content || '').trim()
+    if (!normalized) {
+      return
+    }
+    const duplicate = messages.value.some(
+      (item) => item.role === 'system' && String(item.content || '').trim() === normalized,
+    )
+    if (duplicate) {
+      return
+    }
+    messages.value = [
+      ...messages.value,
+      {
+        role: 'system',
+        content: normalized,
+        created_at: createdAt,
+      },
+    ]
+    if (session.value) {
+      session.value = {
+        ...session.value,
+        message_count: Math.max((session.value.message_count ?? 0) + 1, messages.value.length),
+      }
+    }
+  }
+
   return {
     session,
     messages,
@@ -91,6 +118,7 @@ export function usePersistentSession() {
     loadSession,
     refreshSummaryOnly,
     loadOlderMessages,
+    appendSystemMessage,
     clear,
   }
 }
