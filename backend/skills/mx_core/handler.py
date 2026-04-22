@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.skills.base import BaseSkill
+from app.skills.context import get_mx_client_config
 from skills.mx_core.client import MXClient
 from skills.mx_core.execution import mx_execution_service
 from skills.mx_core.tool_specs import TOOL_PROFILES
@@ -36,7 +37,8 @@ class Skill(BaseSkill):
                 app_settings=app_settings,
             )
 
-        with MXClient(api_key=getattr(app_settings, "mx_api_key", None)) as runtime_client:
+        config = get_mx_client_config(context)
+        with MXClient(api_key=config.api_key, base_url=config.base_url) as runtime_client:
             return mx_execution_service.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,

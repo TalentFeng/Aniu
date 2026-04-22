@@ -9,8 +9,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from app.db.database import init_db
 from app.db.models import StrategySchedule
 from app.services.aniu_service import aniu_service
-from app.services.mx_skill_service import mx_skill_service
 from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
+from skills.mx_core.execution import mx_execution_service as mx_skill_service
 
 
 def test_execute_run_rejects_unknown_schedule_id(monkeypatch, tmp_path) -> None:

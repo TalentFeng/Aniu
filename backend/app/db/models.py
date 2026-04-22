@@ -49,10 +49,7 @@ class AppSettings(Base):
     trade_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     automation_session_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     automation_context_window_tokens: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, default=65536
-    )
-    automation_target_prompt_tokens: Mapped[int | None] = mapped_column(
-        Integer, nullable=True, default=24000
+        Integer, nullable=True, default=128000
     )
     automation_recent_message_limit: Mapped[int] = mapped_column(
         Integer, default=24

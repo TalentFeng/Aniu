@@ -6,7 +6,8 @@ from typing import Any, Callable, Iterable
 
 import httpx
 
-from app.services.mx_service import MXClient
+from app.skills.providers import build_skill_context
+from skills.mx_core.client import MXClient
 from app.skills import skill_registry
 
 _LLM_TEMPERATURE = 0.2
@@ -247,7 +248,12 @@ class LLMService:
                 {"role": "system", "content": effective_system_prompt}
             )
         payload_messages.extend(messages)
-        chat_tool_context = {**(tool_context or {}), "run_type": "chat"}
+        chat_tool_context = build_skill_context(
+            run_type="chat",
+            app_settings=(tool_context or {}).get("app_settings"),
+            client=(tool_context or {}).get("client"),
+            base_context=tool_context,
+        )
 
         def _chat_tool_executor(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return skill_registry.execute_tool(
@@ -363,11 +369,11 @@ class LLMService:
             return skill_registry.execute_tool(
                 tool_name=tool_name,
                 arguments=arguments,
-                context={
-                    "client": client,
-                    "app_settings": app_settings,
-                    "run_type": run_type,
-                },
+                context=build_skill_context(
+                    run_type=run_type,
+                    app_settings=app_settings,
+                    client=client,
+                ),
             )
 
         result = self._agent_loop(

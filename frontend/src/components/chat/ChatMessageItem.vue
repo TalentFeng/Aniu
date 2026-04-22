@@ -70,7 +70,11 @@ const props = defineProps<{
 
 const attachmentList = computed(() => props.message.attachments ?? [])
 const toolCalls = computed(() => props.message.tool_calls ?? [])
-const roleLabel = computed(() => (props.message.role === 'user' ? '我' : 'Aniu'))
+const roleLabel = computed(() => {
+  if (props.message.role === 'user') return '我'
+  if (props.message.role === 'system') return '系统'
+  return 'Aniu'
+})
 
 const displayContent = computed(() => {
   if (props.message.content) return props.message.content

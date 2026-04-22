@@ -13,6 +13,7 @@ from app.db.database import session_scope
 from app.db.models import ChatMessageRecord, ChatSession, StrategyRun, StrategySchedule
 from app.main import create_app
 from app.services.aniu_service import aniu_service
+from app.services.event_bus import event_bus
 from app.services.llm_service import llm_service
 from app.services.scheduler_service import scheduler_service
 from app.services.trading_calendar_service import trading_calendar_service
@@ -275,5 +276,111 @@ def test_chat_session_list_excludes_automation_sessions(monkeypatch, tmp_path) -
         assert len(payload) == 1
         assert payload[0]["title"] == "User"
         assert payload[0]["kind"] == "user"
+
+    reset_db_state()
+
+
+def test_safe_prompt_budget_uses_85_percent_of_max_context(monkeypatch, tmp_path) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        budget = aniu_service._safe_prompt_budget(
+            SimpleNamespace(automation_context_window_tokens=128000)
+        )
+
+    assert budget == 108800
+
+    reset_db_state()
+
+
+def test_context_compaction_messages_are_not_reinjected_into_model_history(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+            )
+            db.add(session)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="用户历史",
+                        message_kind="live_turn",
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="system",
+                        content="[上下文压缩摘要]\n已压缩",
+                        message_kind="context_compaction",
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="助手历史",
+                        message_kind="live_turn",
+                    ),
+                ]
+            )
+
+        with session_scope() as db:
+            records = aniu_service._list_persistent_session_history_records(
+                db=db,
+                session_id=session.id,
+                recent_limit=24,
+            )
+            messages = aniu_service._build_persistent_session_history_messages(records)
+
+    assert messages == [
+        {"role": "user", "content": "用户历史"},
+        {"role": "assistant", "content": "助手历史"},
+    ]
+
+    reset_db_state()
+
+
+def test_schedule_run_emits_context_compacted_event(monkeypatch, tmp_path) -> None:
+    captured_events: list[dict[str, object]] = []
+
+    def fake_run_agent_with_messages(*, messages, **kwargs):
+        del messages, kwargs
+        return _fake_run_result("scheduled decision")
+
+    monkeypatch.setattr(llm_service, "run_agent_with_messages", fake_run_agent_with_messages)
+
+    with create_test_client(monkeypatch, tmp_path):
+        with session_scope() as db:
+            settings = aniu_service.get_or_create_settings(db)
+            settings.mx_api_key = "mx-key"
+            settings.llm_base_url = "https://example.com/v1"
+            settings.llm_api_key = "llm-key"
+            settings.llm_model = "demo-model"
+            settings.automation_recent_message_limit = 4
+            schedule = _prepare_schedule(db, name="盘前分析", run_type="analysis")
+            schedule_id = schedule.id
+
+        for _ in range(4):
+            aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+        run = aniu_service.start_run_async(trigger_source="schedule", schedule_id=schedule_id)
+        for event in event_bus.stream(run):
+            captured_events.append(event)
+
+        with session_scope() as db:
+            session = db.query(ChatSession).filter(ChatSession.kind == "automation").one()
+            messages = (
+                db.query(ChatMessageRecord)
+                .filter(ChatMessageRecord.session_id == session.id)
+                .order_by(ChatMessageRecord.id.asc())
+                .all()
+            )
+
+    compacted = [event for event in captured_events if event.get("type") == "context_compacted"]
+    assert len(compacted) == 1
+    assert str(compacted[0].get("content") or "").startswith("[上下文压缩摘要]\n")
+    assert any(item.message_kind == "context_compaction" for item in messages)
 
     reset_db_state()

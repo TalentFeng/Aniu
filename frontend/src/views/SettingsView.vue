@@ -21,11 +21,18 @@
               <input v-model="settings.llm_api_key" type="password" placeholder="sk-..." />
               <p class="field-help">用于访问大模型 API 的密钥。</p>
             </label>
-            <label class="field">
-              <span>模型名</span>
-              <input v-model="settings.llm_model" />
-              <p class="field-help">要使用的大模型名称，例如 `gpt-4o-mini`。</p>
-            </label>
+            <div class="settings-inline-fields">
+              <label class="field">
+                <span>模型名</span>
+                <input v-model="settings.llm_model" />
+                <p class="field-help">要使用的大模型名称，例如 `gpt-4o-mini`。</p>
+              </label>
+              <label class="field">
+                <span>最大上下文</span>
+                <input v-model.number="settings.automation_context_window_tokens" type="number" min="4096" step="1024" />
+                <p class="field-help">默认 128K。后端会按该值的 85% 作为自动化会话上下文压缩触发预算。</p>
+              </label>
+            </div>
             <label class="field">
               <span>妙想密钥</span>
               <input v-model="settings.mx_api_key" type="password" placeholder="妙想接口 apikey" />
@@ -76,16 +83,16 @@
             <span class="meta-label">已安装技能</span>
             <strong>总数 {{ installedOverview.total }}</strong>
             <div class="skills-overview-breakdown">
-              <span>系统技能 {{ installedOverview.builtin }}</span>
-              <span>用户技能 {{ installedOverview.workspace }}</span>
+              <span>运行时技能 {{ installedOverview.runtime }}</span>
+              <span>标准技能 {{ installedOverview.standard }}</span>
             </div>
           </div>
           <div class="skills-overview-card">
             <span class="meta-label">已启用技能</span>
             <strong>总数 {{ enabledOverview.total }}</strong>
             <div class="skills-overview-breakdown">
-              <span>系统技能 {{ enabledOverview.builtin }}</span>
-              <span>用户技能 {{ enabledOverview.workspace }}</span>
+              <span>运行时技能 {{ enabledOverview.runtime }}</span>
+              <span>标准技能 {{ enabledOverview.standard }}</span>
             </div>
           </div>
           <div class="skills-import-cluster">
@@ -141,9 +148,9 @@
                 <strong>{{ skill.name }}</strong>
                 <span
                   class="skill-source-badge"
-                  :class="skill.source === 'builtin' ? 'is-system' : 'is-user'"
+                  :class="skill.role === 'runtime' ? 'is-system' : 'is-user'"
                 >
-                  {{ skill.source === 'builtin' ? '系统技能' : '用户技能' }}
+                  {{ skill.role === 'runtime' ? '运行时技能' : skill.source === 'builtin' ? '内置技能' : '用户技能' }}
                 </span>
               </div>
 
@@ -159,7 +166,7 @@
 
             <div class="skill-card-footer">
               <button
-                v-if="skill.source === 'workspace'"
+                v-if="skill.can_delete"
                 type="button"
                 class="button ghost small soft-header-button skill-delete-action"
                 :disabled="skillsBusy"
@@ -273,14 +280,14 @@ async function toggleSkill(skill: SkillListItem) {
 }
 
 async function deleteSkill(skill: SkillListItem) {
-  if (skill.source !== 'workspace') {
+  if (!skill.can_delete) {
     return
   }
   await deleteManagedSkill(skill)
 }
 
 function canToggleSkill(skill: SkillListItem) {
-  return skill.id !== 'builtin_utils'
+  return skill.can_disable
 }
 
 onMounted(async () => {

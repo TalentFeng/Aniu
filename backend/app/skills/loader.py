@@ -44,7 +44,7 @@ class SkillPackage:
         return self.path / "SKILL.md"
 
     def _metadata_payloads(self) -> list[dict[str, Any]]:
-        payloads: list[dict[str, Any]] = []
+        payloads: list[dict[str, Any]] = [self.metadata]
         nested = self.metadata.get("metadata")
         if isinstance(nested, dict):
             for key in ("aniu", "openclaw", "nanobot"):
@@ -53,6 +53,30 @@ class SkillPackage:
                     payloads.append(value)
         return payloads
 
+    def _first_str(self, key: str) -> str | None:
+        for payload in self._metadata_payloads():
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _first_bool(self, key: str) -> bool | None:
+        for payload in self._metadata_payloads():
+            value = payload.get(key)
+            if isinstance(value, bool):
+                return value
+        return None
+
+    def _capability_flag(self, key: str) -> bool | None:
+        for payload in self._metadata_payloads():
+            capabilities = payload.get("capabilities")
+            if not isinstance(capabilities, dict):
+                continue
+            value = capabilities.get(key)
+            if isinstance(value, bool):
+                return value
+        return None
+
     @property
     def run_types(self) -> list[str]:
         if self.skill is not None and getattr(self.skill, "run_types", None):
@@ -60,7 +84,7 @@ class SkillPackage:
             if isinstance(run_types, list):
                 return [str(item).strip() for item in run_types if str(item).strip()]
 
-        for payload in [self.metadata, *self._metadata_payloads()]:
+        for payload in self._metadata_payloads():
             run_types = payload.get("run_types")
             if isinstance(run_types, list):
                 normalized = [str(item).strip() for item in run_types if str(item).strip()]
@@ -69,18 +93,44 @@ class SkillPackage:
         return []
 
     @property
+    def role(self) -> str:
+        role = (self._first_str("role") or "standard").strip().lower()
+        return role if role == "runtime" else "standard"
+
+    @property
     def always(self) -> bool:
-        for payload in [self.metadata, *self._metadata_payloads()]:
+        for payload in self._metadata_payloads():
             value = payload.get("always")
             if isinstance(value, bool):
                 return value
         return False
 
     @property
+    def always_enabled(self) -> bool:
+        configured = self._capability_flag("always_enabled")
+        if configured is not None:
+            return configured
+        return self.role == "runtime"
+
+    @property
+    def can_disable(self) -> bool:
+        configured = self._capability_flag("can_disable")
+        if configured is not None:
+            return configured
+        return not self.always_enabled
+
+    @property
+    def can_delete(self) -> bool:
+        configured = self._capability_flag("can_delete")
+        if configured is not None:
+            return configured
+        return self.source == "workspace"
+
+    @property
     def requires(self) -> dict[str, list[str]]:
         bins: list[str] = []
         envs: list[str] = []
-        for payload in [self.metadata, *self._metadata_payloads()]:
+        for payload in self._metadata_payloads():
             requires = payload.get("requires")
             if not isinstance(requires, dict):
                 continue
@@ -106,7 +156,11 @@ class SkillPackage:
             "name": self.name,
             "description": self.description,
             "source": self.source,
+            "role": self.role,
             "enabled": enabled,
+            "can_disable": self.can_disable,
+            "can_delete": self.can_delete,
+            "always_enabled": self.always_enabled,
             "has_handler": self.skill is not None,
             "tool_names": sorted(self.tool_names()),
         }

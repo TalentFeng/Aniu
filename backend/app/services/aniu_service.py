@@ -32,12 +32,13 @@ from app.db.models import (
 )
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
 from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
+from app.skills.providers import build_skill_context
 from app.services.event_bus import event_bus, make_emitter
 from app.services.llm_service import LLMStreamCancelled, llm_service
-from app.services.mx_skill_service import mx_skill_service
-from app.services.mx_service import MXClient
 from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
+from skills.mx_core.client import MXClient
+from skills.mx_core.execution import mx_execution_service
 
 
 logger = logging.getLogger(__name__)
@@ -56,12 +57,10 @@ ACCOUNT_PREFETCH_TOOL_NAMES = (
 ACCOUNT_OVERVIEW_CACHE_MAX_WORKERS = 3
 AUTOMATION_SESSION_SLUG = "automation-default"
 AUTOMATION_SESSION_TITLE = "自动化交易会话"
-AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 65536
-AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS = 24000
+AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
 AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT = 24
 AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS = 12
-AUTOMATION_RESERVED_OUTPUT_TOKENS = 4000
-AUTOMATION_SAFETY_BUFFER_TOKENS = 2000
+AUTOMATION_COMPACTION_TRIGGER_RATIO = 0.85
 
 
 @dataclass
@@ -1250,10 +1249,17 @@ class AniuService:
         positions_result = cached_positions_result
         orders_result = cached_orders_result
         client: MXClient | None = None
+        mx_client_config = build_skill_context(
+            run_type="chat",
+            app_settings=settings,
+        )["mx_client_config"]
 
-        if settings.mx_api_key:
+        if mx_client_config.get("api_key"):
             try:
-                client = MXClient(api_key=settings.mx_api_key)
+                client = MXClient(
+                    api_key=mx_client_config.get("api_key"),
+                    base_url=mx_client_config.get("base_url"),
+                )
             except Exception as exc:
                 if (
                     balance_result is None
@@ -1379,7 +1385,7 @@ class AniuService:
             system_prompt=settings.system_prompt,
             messages=messages,
             timeout_seconds=1800,
-            tool_context={"app_settings": settings},
+            tool_context=build_skill_context(run_type="chat", app_settings=settings),
         )
 
         return {
@@ -1435,7 +1441,10 @@ class AniuService:
                     system_prompt=settings_snapshot.system_prompt,
                     messages=messages,
                     timeout_seconds=180,
-                    tool_context={"app_settings": settings_snapshot},
+                    tool_context=build_skill_context(
+                        run_type="chat",
+                        app_settings=settings_snapshot,
+                    ),
                     emit=_emit,
                     cancel_event=cancel_event,
                 )
@@ -1761,11 +1770,6 @@ class AniuService:
                     "automation_context_window_tokens",
                     AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS,
                 ),
-                "automation_target_prompt_tokens": getattr(
-                    settings,
-                    "automation_target_prompt_tokens",
-                    AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS,
-                ),
                 "automation_recent_message_limit": getattr(
                     settings,
                     "automation_recent_message_limit",
@@ -1815,9 +1819,16 @@ class AniuService:
             )
 
             settings = SimpleNamespace(**settings_snapshot)
-            if not settings.mx_api_key:
+            mx_client_config = build_skill_context(
+                run_type=getattr(settings, "run_type", "analysis"),
+                app_settings=settings,
+            )["mx_client_config"]
+            if not mx_client_config.get("api_key"):
                 raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
-            client = MXClient(api_key=settings.mx_api_key)
+            client = MXClient(
+                api_key=mx_client_config.get("api_key"),
+                base_url=mx_client_config.get("base_url"),
+            )
             try:
                 _emit("stage", stage="llm", message="正在调用大模型")
                 session_context = self._prepare_persistent_session_context(
@@ -1924,6 +1935,7 @@ class AniuService:
                 if session_context is not None:
                     session = db.get(ChatSession, session_context.session_id)
                     if session is not None:
+                        previous_summary_revision = int(session.summary_revision or 0)
                         assistant_content = self._build_persistent_session_assistant_content(
                             run_id=run_id,
                             run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
@@ -1959,7 +1971,29 @@ class AniuService:
                                 ),
                             )
                         )
-                        del archived_summary
+                        if (
+                            summary_version is not None
+                            and int(summary_version) > previous_summary_revision
+                            and str(archived_summary or "").strip()
+                        ):
+                            summary_message = self._persist_persistent_session_system_message(
+                                db=db,
+                                session=session,
+                                run_id=run_id,
+                                content="[上下文压缩摘要]\n" + str(archived_summary).strip(),
+                                meta_payload={
+                                    "summary_revision": int(summary_version),
+                                    "last_compacted_run_id": session.last_compacted_run_id,
+                                },
+                            )
+                            _emit(
+                                "context_compacted",
+                                message="已生成上下文压缩摘要",
+                                content=summary_message.content,
+                                summary_revision=int(summary_version),
+                                message_id=summary_message.id,
+                                run_id=run_id,
+                            )
                         run.context_summary_version = (
                             int(summary_version)
                             if summary_version is not None
@@ -2428,10 +2462,6 @@ class AniuService:
             getattr(settings, "automation_context_window_tokens", None)
             or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
         )
-        settings.automation_target_prompt_tokens = int(
-            getattr(settings, "automation_target_prompt_tokens", None)
-            or AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS
-        )
         settings.automation_recent_message_limit = int(
             getattr(settings, "automation_recent_message_limit", None)
             or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
@@ -2585,6 +2615,30 @@ class AniuService:
         db.add(session)
         return record
 
+    def _persist_persistent_session_system_message(
+        self,
+        *,
+        db: Session,
+        session: ChatSession,
+        run_id: int,
+        content: str,
+        meta_payload: dict[str, Any] | None,
+    ) -> ChatMessageRecord:
+        record = ChatMessageRecord(
+            session_id=session.id,
+            role="system",
+            content=content,
+            source="automation_run",
+            run_id=run_id,
+            message_kind="context_compaction",
+            meta_payload=meta_payload or None,
+        )
+        db.add(record)
+        db.flush()
+        session.last_message_at = now_utc()
+        db.add(session)
+        return record
+
     def _list_persistent_session_history_records(
         self,
         *,
@@ -2620,6 +2674,8 @@ class AniuService:
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         for record in records:
+            if str(record.message_kind or "").strip() == "context_compaction":
+                continue
             if record.role not in {"user", "assistant", "system"}:
                 continue
             content = str(record.content or "").strip()
@@ -2715,17 +2771,7 @@ class AniuService:
             getattr(settings, "automation_context_window_tokens", 0)
             or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
         )
-        safe_budget = max(
-            2048,
-            context_window
-            - AUTOMATION_RESERVED_OUTPUT_TOKENS
-            - AUTOMATION_SAFETY_BUFFER_TOKENS,
-        )
-        configured_target = int(
-            getattr(settings, "automation_target_prompt_tokens", 0)
-            or AUTOMATION_DEFAULT_TARGET_PROMPT_TOKENS
-        )
-        return min(configured_target, int(safe_budget * 0.7))
+        return max(2048, int(context_window * AUTOMATION_COMPACTION_TRIGGER_RATIO))
 
     def _should_compact_automation_session(
         self,

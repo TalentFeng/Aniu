@@ -1135,6 +1135,17 @@ textarea {
   align-self: flex-start;
 }
 
+.chat-message.role-system {
+  align-self: center;
+  max-width: min(100%, 640px);
+  background: rgba(133, 148, 172, 0.12);
+  border-color: rgba(133, 148, 172, 0.24);
+}
+
+.chat-message.role-system .chat-message-role {
+  color: #c8d4e8;
+}
+
 .chat-message-role {
   font-size: 11px;
   font-weight: 700;
@@ -3718,6 +3729,13 @@ textarea {
   gap: 16px;
 }
 
+.settings-inline-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
 .settings-right {
   display: flex;
   flex-direction: column;
@@ -4296,6 +4314,7 @@ textarea {
   }
 
   .skills-import-inline,
+  .settings-inline-fields,
   .skill-card-list {
     grid-template-columns: 1fr;
   }
