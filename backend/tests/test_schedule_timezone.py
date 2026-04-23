@@ -1220,7 +1220,7 @@ def test_execute_run_sends_bark_notification_after_completion(monkeypatch, tmp_p
         del app_settings, client, messages, emit
         return (
             {
-                "final_answer": "执行完成，保持观察。",
+                "final_answer": "执行完成，" + ("保持观察。" * 80),
                 "tool_calls": [],
             },
             {"messages": []},
@@ -1254,6 +1254,7 @@ def test_execute_run_sends_bark_notification_after_completion(monkeypatch, tmp_p
     assert captured["title"] == "Aniu 任务完成"
     assert "运行 ID" in str(captured["body"])
     assert "状态: completed" in str(captured["body"])
+    assert "保持观察。保持观察。保持观察。" in str(captured["body"])
 
 
 def test_execute_run_sends_wecom_notification_after_failure(monkeypatch, tmp_path) -> None:

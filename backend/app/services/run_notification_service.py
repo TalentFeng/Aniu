@@ -111,9 +111,9 @@ class RunNotificationService:
         if status == "failed" and error_message:
             lines.append(f"错误: {error_message}")
         elif analysis_summary:
-            lines.append(f"摘要: {analysis_summary[:200]}")
+            lines.append(f"摘要: {analysis_summary}")
         elif final_answer:
-            lines.append(f"结果: {final_answer[:200]}")
+            lines.append(f"结果: {final_answer}")
 
         return title, "\n".join(lines)
 
