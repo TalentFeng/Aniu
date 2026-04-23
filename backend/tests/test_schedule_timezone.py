@@ -1177,6 +1177,155 @@ def test_execute_run_passes_emit_when_run_agent_supports_it(monkeypatch, tmp_pat
     assert captured["emit_is_callable"] is True
 
 
+def test_execute_run_sends_bark_notification_after_completion(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请分析当前账户。",
+                "operation_notify_enabled": True,
+                "operation_notify_channel": "bark",
+                "bark_server_url": "https://api.day.app",
+                "bark_device_key": "device-key",
+                "wecom_webhook_url": None,
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del app_settings, client, messages, emit
+        return (
+            {
+                "final_answer": "执行完成，保持观察。",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    def fake_send_bark(*, config, title, body):
+        captured["channel"] = config.channel
+        captured["title"] = title
+        captured["body"] = body
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+    monkeypatch.setattr(
+        aniu_service_module.run_notification_service,
+        "_send_bark",
+        fake_send_bark,
+    )
+
+    run = aniu_service.execute_run(trigger_source="manual")
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert captured["channel"] == "bark"
+    assert captured["title"] == "Aniu 任务完成"
+    assert "运行 ID" in str(captured["body"])
+    assert "状态: completed" in str(captured["body"])
+
+
+def test_execute_run_sends_wecom_notification_after_failure(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请分析当前账户。",
+                "operation_notify_enabled": True,
+                "operation_notify_channel": "wecom",
+                "bark_server_url": "https://api.day.app",
+                "bark_device_key": None,
+                "wecom_webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test",
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del app_settings, client, messages, emit
+        raise RuntimeError("llm boom")
+
+    def fake_send_wecom(*, config, title, body):
+        captured["channel"] = config.channel
+        captured["title"] = title
+        captured["body"] = body
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+    monkeypatch.setattr(
+        aniu_service_module.run_notification_service,
+        "_send_wecom",
+        fake_send_wecom,
+    )
+
+    with pytest.raises(RuntimeError, match="llm boom"):
+        aniu_service.execute_run(trigger_source="manual")
+
+    _reset_db_state()
+
+    assert captured["channel"] == "wecom"
+    assert captured["title"] == "Aniu 任务失败"
+    assert "错误: llm boom" in str(captured["body"])
+
+
 def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> None:
     _use_temp_db(monkeypatch, tmp_path)
     init_db()

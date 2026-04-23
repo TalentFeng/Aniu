@@ -26,6 +26,11 @@ class AppSettingsBase(BaseModel):
     automation_recent_message_limit: int = Field(default=24, ge=4, le=200)
     automation_enable_auto_compaction: bool = True
     automation_idle_summary_hours: int = Field(default=12, ge=1, le=168)
+    operation_notify_enabled: bool = False
+    operation_notify_channel: Literal["bark", "wecom"] | None = None
+    bark_server_url: str | None = Field(default="https://api.day.app", max_length=512)
+    bark_device_key: str | None = Field(default=None, max_length=512)
+    wecom_webhook_url: str | None = Field(default=None, max_length=1024)
 
 
 class AppSettingsRead(AppSettingsBase):
@@ -39,6 +44,8 @@ class AppSettingsRead(AppSettingsBase):
     def mask_sensitive_fields(self) -> "AppSettingsRead":
         self.mx_api_key = _mask_key(self.mx_api_key)
         self.llm_api_key = _mask_key(self.llm_api_key)
+        self.bark_device_key = _mask_key(self.bark_device_key)
+        self.wecom_webhook_url = _mask_key(self.wecom_webhook_url)
         return self
 
 

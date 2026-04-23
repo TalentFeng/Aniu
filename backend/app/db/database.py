@@ -85,6 +85,20 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN automation_idle_summary_hours INTEGER DEFAULT 12"
         )
+    if "operation_notify_enabled" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN operation_notify_enabled BOOLEAN DEFAULT 0"
+        )
+    if "operation_notify_channel" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN operation_notify_channel VARCHAR(16)"
+        )
+    if "bark_server_url" not in columns:
+        statements.append("ALTER TABLE app_settings ADD COLUMN bark_server_url VARCHAR(255)")
+    if "bark_device_key" not in columns:
+        statements.append("ALTER TABLE app_settings ADD COLUMN bark_device_key VARCHAR(255)")
+    if "wecom_webhook_url" not in columns:
+        statements.append("ALTER TABLE app_settings ADD COLUMN wecom_webhook_url VARCHAR(512)")
     if "automation_context_source" not in columns:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN automation_context_source VARCHAR(32) DEFAULT 'default'"
@@ -107,6 +121,8 @@ def _ensure_app_settings_columns(engine) -> None:
                 "ELSE automation_context_window_tokens END, "
                 "automation_recent_message_limit = COALESCE(automation_recent_message_limit, 24), "
                 "automation_enable_auto_compaction = COALESCE(automation_enable_auto_compaction, 1), "
+                "operation_notify_enabled = COALESCE(operation_notify_enabled, 0), "
+                "bark_server_url = COALESCE(NULLIF(trim(bark_server_url), ''), 'https://api.day.app'), "
                 "automation_idle_summary_hours = COALESCE(automation_idle_summary_hours, 12), "
                 "automation_context_source = COALESCE(NULLIF(trim(automation_context_source), ''), 'default')"
             )

@@ -35,6 +35,7 @@ from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.skills.providers import build_skill_context
 from app.services.event_bus import event_bus, make_emitter
 from app.services.llm_service import LLMStreamCancelled, llm_service
+from app.services.run_notification_service import run_notification_service
 from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
 from skills.mx_core.client import MXClient
@@ -359,7 +360,7 @@ class AniuService:
 
     def update_settings(self, db: Session, payload: AppSettingsUpdate) -> AppSettings:
         instance = self.get_or_create_settings(db)
-        sensitive_fields = {"mx_api_key", "llm_api_key"}
+        sensitive_fields = {"mx_api_key", "llm_api_key", "bark_device_key", "wecom_webhook_url"}
         changed_fields: list[str] = []
         for field, value in payload.model_dump().items():
             if field in sensitive_fields:
@@ -1757,6 +1758,7 @@ class AniuService:
                 "llm_model": settings.llm_model,
                 "run_type": schedule.run_type if schedule else manual_resolved_run_type,
                 "schedule_id": schedule.id if schedule else None,
+                "schedule_name": schedule.name if schedule else None,
                 "system_prompt": settings.system_prompt,
                 "task_prompt": schedule.task_prompt if schedule else manual_task_prompt,
                 "timeout_seconds": int(
@@ -1783,6 +1785,15 @@ class AniuService:
                     "automation_idle_summary_hours",
                     AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS,
                 ),
+                "operation_notify_enabled": getattr(
+                    settings, "operation_notify_enabled", False
+                ),
+                "operation_notify_channel": getattr(
+                    settings, "operation_notify_channel", None
+                ),
+                "bark_server_url": getattr(settings, "bark_server_url", None),
+                "bark_device_key": getattr(settings, "bark_device_key", None),
+                "wecom_webhook_url": getattr(settings, "wecom_webhook_url", None),
                 "automation_context_source": getattr(
                     settings, "automation_context_source", "default"
                 ),
@@ -2012,6 +2023,21 @@ class AniuService:
                 )
 
             if not return_full_run:
+                run_notification_service.send_run_result(
+                    settings=settings,
+                    run=SimpleNamespace(
+                        id=run_id,
+                        status="completed",
+                        run_type=getattr(settings, "run_type", "analysis"),
+                        trigger_source=trigger_source,
+                        schedule_name=settings_snapshot.get("schedule_name"),
+                        analysis_summary=self._build_analysis_summary(
+                            decision.get("final_answer")
+                        ),
+                        final_answer=str(decision.get("final_answer") or "").strip() or None,
+                        executed_actions=executed_actions,
+                    ),
+                )
                 logger.info(
                     "execute_run completed: run_id=%s, actions=%d",
                     run_id,
@@ -2028,6 +2054,10 @@ class AniuService:
                 run = self.get_run(db, run_id)
                 if run is None:
                     raise RuntimeError("运行记录不存在。")
+                run_notification_service.send_run_result(
+                    settings=settings,
+                    run=run,
+                )
                 logger.info(
                     "execute_run completed: run_id=%s, actions=%d",
                     run_id,
@@ -2119,6 +2149,21 @@ class AniuService:
                         else:
                             schedule.retry_count = max(int(schedule.retry_count or 0), 0)
                         db.add(schedule)
+            run_notification_service.send_run_result(
+                settings=SimpleNamespace(**settings_snapshot),
+                run=SimpleNamespace(
+                    id=run_id,
+                    status="failed",
+                    run_type=settings_snapshot.get("run_type"),
+                    trigger_source=trigger_source,
+                    schedule_name=settings_snapshot.get("schedule_name"),
+                    analysis_summary=None,
+                    final_answer=None,
+                    executed_actions=None,
+                    error_message=str(exc),
+                ),
+                error_message=str(exc),
+            )
             _emit("failed", message=str(exc))
             raise
 

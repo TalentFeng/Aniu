@@ -36,6 +36,11 @@ const defaultSettings = (): SettingsPayload => ({
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
   automation_context_window_tokens: 128000,
+  operation_notify_enabled: false,
+  operation_notify_channel: 'bark',
+  bark_server_url: 'https://api.day.app',
+  bark_device_key: '',
+  wecom_webhook_url: '',
   system_prompt: '你是跨越完整牛熊周期的顶尖私募投资机构老将与极度理性的专业交易员，你深谙A股政策驱动、外资流动与资金博弈机制。你必须持续运行以下自我驱动循环，监控经济、政策、盘面数据及资金流向，研判周期位置与市场情绪，寻找共识与预期差，定性博弈逻辑，自主决策执行交易操作。你的唯一目标是追求收益最大化。',
 })
 
@@ -213,6 +218,11 @@ export const useAppStore = defineStore('app', () => {
     settings.llm_api_key = payload.llm_api_key ?? ''
     settings.llm_model = payload.llm_model
     settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 128000
+    settings.operation_notify_enabled = payload.operation_notify_enabled ?? false
+    settings.operation_notify_channel = payload.operation_notify_channel ?? 'bark'
+    settings.bark_server_url = payload.bark_server_url ?? 'https://api.day.app'
+    settings.bark_device_key = payload.bark_device_key ?? ''
+    settings.wecom_webhook_url = payload.wecom_webhook_url ?? ''
     settings.system_prompt = payload.system_prompt
   }
 
@@ -334,6 +344,9 @@ export const useAppStore = defineStore('app', () => {
         mx_api_key: settings.mx_api_key || null,
         llm_base_url: settings.llm_base_url || null,
         llm_api_key: settings.llm_api_key || null,
+        bark_server_url: settings.bark_server_url || null,
+        bark_device_key: settings.bark_device_key || null,
+        wecom_webhook_url: settings.wecom_webhook_url || null,
       })
       applySettings(payload)
       notice.value = '系统设置已保存。'

@@ -38,6 +38,46 @@
               <input v-model="settings.mx_api_key" type="password" placeholder="妙想接口 apikey" />
               <p class="field-help">用于访问东方财富妙想接口的密钥。</p>
             </label>
+            <div class="field field-checkbox">
+              <label class="checkbox-row">
+                <input v-model="settings.operation_notify_enabled" type="checkbox" />
+                <span>执行任务后发送通知</span>
+              </label>
+              <p class="field-help">任务完成或失败后，向 Bark 或企业微信机器人发送一条消息。</p>
+            </div>
+            <div class="settings-inline-fields">
+              <label class="field">
+                <span>通知渠道</span>
+                <select v-model="settings.operation_notify_channel">
+                  <option value="bark">Bark</option>
+                  <option value="wecom">企业微信</option>
+                </select>
+                <p class="field-help">当前仅发送到一个渠道，按这里的选项生效。</p>
+              </label>
+            </div>
+            <template v-if="settings.operation_notify_channel === 'bark'">
+              <label class="field">
+                <span>Bark Server</span>
+                <input v-model="settings.bark_server_url" placeholder="https://api.day.app" />
+                <p class="field-help">Bark 服务地址，默认官方地址。</p>
+              </label>
+              <label class="field">
+                <span>Bark Device Key</span>
+                <input v-model="settings.bark_device_key" type="password" placeholder="填入 Bark device key" />
+                <p class="field-help">用于向指定设备推送消息。</p>
+              </label>
+            </template>
+            <template v-else>
+              <label class="field">
+                <span>企业微信 Webhook</span>
+                <input
+                  v-model="settings.wecom_webhook_url"
+                  type="password"
+                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                />
+                <p class="field-help">填写群机器人 webhook 地址即可。</p>
+              </label>
+            </template>
           </div>
           <div class="settings-right">
             <label class="field">

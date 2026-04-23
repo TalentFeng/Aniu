@@ -6,6 +6,11 @@ export interface AppSettings {
   llm_api_key: string | null
   llm_model: string
   automation_context_window_tokens: number | null
+  operation_notify_enabled: boolean
+  operation_notify_channel: 'bark' | 'wecom' | null
+  bark_server_url: string | null
+  bark_device_key: string | null
+  wecom_webhook_url: string | null
   system_prompt: string
   created_at: string
   updated_at: string

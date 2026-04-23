@@ -318,6 +318,11 @@ def test_settings_endpoint_updates_max_context_tokens(monkeypatch, tmp_path) -> 
                 "llm_api_key": "sk-test",
                 "llm_model": "gpt-5.4",
                 "automation_context_window_tokens": 128000,
+                "operation_notify_enabled": True,
+                "operation_notify_channel": "wecom",
+                "bark_server_url": "https://api.day.app",
+                "bark_device_key": "bark-device-key",
+                "wecom_webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test",
                 "system_prompt": "system prompt",
                 "automation_session_id": None,
                 "automation_recent_message_limit": 24,
@@ -331,6 +336,10 @@ def test_settings_endpoint_updates_max_context_tokens(monkeypatch, tmp_path) -> 
     payload = response.json()
     assert payload["llm_model"] == "gpt-5.4"
     assert payload["automation_context_window_tokens"] == 128000
+    assert payload["operation_notify_enabled"] is True
+    assert payload["operation_notify_channel"] == "wecom"
+    assert "****" in str(payload["bark_device_key"])
+    assert "****" in str(payload["wecom_webhook_url"])
 
     database_module._engine = None
     database_module._session_local = None
