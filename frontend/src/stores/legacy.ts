@@ -2,7 +2,7 @@ import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { api } from '@/services/api'
-import type { AccountOverview, AppSettings, RunDetail, RuntimeOverview, ScheduleConfig } from '@/types'
+import type { AccountOverview, AppSettings, RoundtableModelConfig, RunDetail, RuntimeOverview, ScheduleConfig } from '@/types'
 
 const ACCOUNT_REFRESH_COOLDOWN_MS = 60 * 60 * 1000
 const ACCOUNT_REFRESH_STORAGE_KEY = 'aniu-account-last-refresh-at'
@@ -14,6 +14,18 @@ function uid(): string {
     return crypto.randomUUID()
   }
   return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+}
+
+function createRoundtableModelDraft(overrides?: Partial<RoundtableModelConfig>): RoundtableModelConfig {
+  return {
+    id: uid(),
+    name: '',
+    llm_base_url: '',
+    llm_api_key: '',
+    llm_model: 'gpt-4o-mini',
+    enabled: true,
+    ...overrides,
+  }
 }
 
 interface ScheduleOverviewItem {
@@ -36,6 +48,12 @@ const defaultSettings = (): SettingsPayload => ({
   llm_api_key: '',
   llm_model: 'gpt-4o-mini',
   automation_context_window_tokens: 128000,
+  roundtable_enabled: false,
+  roundtable_moderator: createRoundtableModelDraft({ name: '主持人' }),
+  roundtable_participants: [
+    createRoundtableModelDraft({ name: 'AI 1' }),
+    createRoundtableModelDraft({ name: 'AI 2' }),
+  ],
   operation_notify_enabled: false,
   operation_notify_channel: 'bark',
   bark_server_url: 'https://api.day.app',
@@ -218,6 +236,22 @@ export const useAppStore = defineStore('app', () => {
     settings.llm_api_key = payload.llm_api_key ?? ''
     settings.llm_model = payload.llm_model
     settings.automation_context_window_tokens = payload.automation_context_window_tokens ?? 128000
+    settings.roundtable_enabled = payload.roundtable_enabled ?? false
+    settings.roundtable_moderator = payload.roundtable_moderator
+      ? createRoundtableModelDraft({
+        ...payload.roundtable_moderator,
+        id: payload.roundtable_moderator.id ?? uid(),
+        llm_base_url: payload.roundtable_moderator.llm_base_url ?? '',
+        llm_api_key: payload.roundtable_moderator.llm_api_key ?? '',
+      })
+      : createRoundtableModelDraft({ name: '主持人' })
+    settings.roundtable_participants = (payload.roundtable_participants ?? []).map((item, index) => createRoundtableModelDraft({
+      ...item,
+      id: item.id ?? uid(),
+      name: item.name || `AI ${index + 1}`,
+      llm_base_url: item.llm_base_url ?? '',
+      llm_api_key: item.llm_api_key ?? '',
+    }))
     settings.operation_notify_enabled = payload.operation_notify_enabled ?? false
     settings.operation_notify_channel = payload.operation_notify_channel ?? 'bark'
     settings.bark_server_url = payload.bark_server_url ?? 'https://api.day.app'
@@ -344,6 +378,18 @@ export const useAppStore = defineStore('app', () => {
         mx_api_key: settings.mx_api_key || null,
         llm_base_url: settings.llm_base_url || null,
         llm_api_key: settings.llm_api_key || null,
+        roundtable_moderator: settings.roundtable_moderator
+          ? {
+            ...settings.roundtable_moderator,
+            llm_base_url: settings.roundtable_moderator.llm_base_url || null,
+            llm_api_key: settings.roundtable_moderator.llm_api_key || null,
+          }
+          : null,
+        roundtable_participants: settings.roundtable_participants.map((item) => ({
+          ...item,
+          llm_base_url: item.llm_base_url || null,
+          llm_api_key: item.llm_api_key || null,
+        })),
         bark_server_url: settings.bark_server_url || null,
         bark_device_key: settings.bark_device_key || null,
         wecom_webhook_url: settings.wecom_webhook_url || null,

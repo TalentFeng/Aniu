@@ -1,3 +1,12 @@
+export interface RoundtableModelConfig {
+  id: string | null
+  name: string
+  llm_base_url: string | null
+  llm_api_key: string | null
+  llm_model: string
+  enabled: boolean
+}
+
 export interface AppSettings {
   id: number
   provider_name: string
@@ -6,6 +15,9 @@ export interface AppSettings {
   llm_api_key: string | null
   llm_model: string
   automation_context_window_tokens: number | null
+  roundtable_enabled: boolean
+  roundtable_moderator: RoundtableModelConfig | null
+  roundtable_participants: RoundtableModelConfig[]
   operation_notify_enabled: boolean
   operation_notify_channel: 'bark' | 'wecom' | null
   bark_server_url: string | null
@@ -248,6 +260,12 @@ export interface ChatRequest {
 export interface ChatResponse {
   message: ChatMessage
   context: Record<string, boolean>
+  roundtable?: {
+    enabled: boolean
+    moderator: { id?: string | null, name: string }
+    speeches: Array<{ id?: string | null, name: string, content: string, status: string }>
+    summary: string
+  } | null
 }
 
 export interface ChatSession {

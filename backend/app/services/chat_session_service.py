@@ -29,6 +29,7 @@ from app.schemas.aniu import (
 )
 from app.skills.providers import build_skill_context
 from app.services.llm_service import LLMStreamCancelled, llm_service
+from app.services.roundtable_service import roundtable_service
 
 
 logger = logging.getLogger(__name__)
@@ -675,7 +676,10 @@ class ChatSessionService:
             from app.services.aniu_service import aniu_service
 
             settings = aniu_service.get_or_create_settings(db)
-            if not settings.llm_base_url or not settings.llm_api_key:
+            if (
+                not roundtable_service.is_enabled(settings)
+                and (not settings.llm_base_url or not settings.llm_api_key)
+            ):
                 raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 
             session = db.get(ChatSession, payload.session_id)
@@ -715,6 +719,9 @@ class ChatSessionService:
                 llm_model=settings.llm_model,
                 llm_base_url=str(settings.llm_base_url),
                 llm_api_key=str(settings.llm_api_key),
+                roundtable_enabled=getattr(settings, "roundtable_enabled", False),
+                roundtable_moderator=getattr(settings, "roundtable_moderator", None),
+                roundtable_participants=getattr(settings, "roundtable_participants", None),
             )
             session_id = session.id
 
@@ -727,20 +734,29 @@ class ChatSessionService:
 
         def _worker() -> None:
             try:
-                content = llm_service.chat(
-                    model=settings_snapshot.llm_model,
-                    base_url=settings_snapshot.llm_base_url,
-                    api_key=settings_snapshot.llm_api_key,
-                    system_prompt=settings_snapshot.system_prompt,
-                    messages=history_messages,
-                    timeout_seconds=180,
-                    tool_context=build_skill_context(
-                        run_type="chat",
-                        app_settings=settings_snapshot,
-                    ),
-                    emit=_emit,
-                    cancel_event=cancel_event,
-                )
+                if roundtable_service.is_enabled(settings_snapshot):
+                    result = roundtable_service.run_chat_roundtable(
+                        settings=settings_snapshot,
+                        messages=history_messages,
+                        emit=_emit,
+                        cancel_event=cancel_event,
+                    )
+                    content = str(result.get("content") or "").strip()
+                else:
+                    content = llm_service.chat(
+                        model=settings_snapshot.llm_model,
+                        base_url=settings_snapshot.llm_base_url,
+                        api_key=settings_snapshot.llm_api_key,
+                        system_prompt=settings_snapshot.system_prompt,
+                        messages=history_messages,
+                        timeout_seconds=180,
+                        tool_context=build_skill_context(
+                            run_type="chat",
+                            app_settings=settings_snapshot,
+                        ),
+                        emit=_emit,
+                        cancel_event=cancel_event,
+                    )
                 _emit("completed", message=content)
             except LLMStreamCancelled:
                 logger.info("chat_session stream worker cancelled: session_id=%s", session_id)

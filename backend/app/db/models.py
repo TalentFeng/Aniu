@@ -58,6 +58,13 @@ class AppSettings(Base):
         Boolean, default=True
     )
     automation_idle_summary_hours: Mapped[int] = mapped_column(Integer, default=12)
+    roundtable_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    roundtable_moderator: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    roundtable_participants: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True
+    )
     operation_notify_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     operation_notify_channel: Mapped[str | None] = mapped_column(
         String(16), nullable=True

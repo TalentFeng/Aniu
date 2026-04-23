@@ -318,6 +318,33 @@ def test_settings_endpoint_updates_max_context_tokens(monkeypatch, tmp_path) -> 
                 "llm_api_key": "sk-test",
                 "llm_model": "gpt-5.4",
                 "automation_context_window_tokens": 128000,
+                "roundtable_enabled": True,
+                "roundtable_moderator": {
+                    "id": "moderator-1",
+                    "name": "主持人",
+                    "llm_base_url": "https://example.com/v1",
+                    "llm_api_key": "sk-moderator",
+                    "llm_model": "gpt-5.4",
+                    "enabled": True,
+                },
+                "roundtable_participants": [
+                    {
+                        "id": "p1",
+                        "name": "AI 1",
+                        "llm_base_url": "https://example.com/v1",
+                        "llm_api_key": "sk-p1",
+                        "llm_model": "gpt-5.4",
+                        "enabled": True,
+                    },
+                    {
+                        "id": "p2",
+                        "name": "AI 2",
+                        "llm_base_url": None,
+                        "llm_api_key": None,
+                        "llm_model": "gpt-5.4-mini",
+                        "enabled": True,
+                    },
+                ],
                 "operation_notify_enabled": True,
                 "operation_notify_channel": "wecom",
                 "bark_server_url": "https://api.day.app",
@@ -336,6 +363,11 @@ def test_settings_endpoint_updates_max_context_tokens(monkeypatch, tmp_path) -> 
     payload = response.json()
     assert payload["llm_model"] == "gpt-5.4"
     assert payload["automation_context_window_tokens"] == 128000
+    assert payload["roundtable_enabled"] is True
+    assert payload["roundtable_moderator"]["name"] == "主持人"
+    assert "****" in str(payload["roundtable_moderator"]["llm_api_key"])
+    assert len(payload["roundtable_participants"]) == 2
+    assert payload["roundtable_participants"][1]["llm_model"] == "gpt-5.4-mini"
     assert payload["operation_notify_enabled"] is True
     assert payload["operation_notify_channel"] == "wecom"
     assert "****" in str(payload["bark_device_key"])
@@ -358,6 +390,87 @@ def test_chat_endpoint_rejects_empty_messages(monkeypatch, tmp_path) -> None:
         )
 
     assert response.status_code == 422
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_chat_endpoint_supports_roundtable_mode(monkeypatch, tmp_path) -> None:
+    from app.services import aniu_service as aniu_service_module
+
+    calls: list[str] = []
+
+    def fake_chat(*, model, base_url, api_key, system_prompt, messages, timeout_seconds=60, tool_context=None, emit=None, cancel_event=None):
+        del base_url, api_key, messages, timeout_seconds, tool_context, emit, cancel_event
+        calls.append(str(model))
+        if "主持人" in str(system_prompt):
+            return "综合来看，应继续观察成交量与风险。"
+        if "AI 1" in str(system_prompt):
+            return "我偏多，理由是趋势延续。"
+        if "AI 2" in str(system_prompt):
+            return "我偏谨慎，理由是回撤风险。"
+        return "未知发言"
+
+    monkeypatch.setattr(aniu_service_module.llm_service, "chat", fake_chat)
+
+    class StubSettings:
+        llm_base_url = "https://example.com/v1"
+        llm_api_key = "sk-main"
+        llm_model = "gpt-5.4"
+        system_prompt = "系统提示词"
+        mx_api_key = "mx-key"
+        disabled_skill_ids_json = "[]"
+        roundtable_enabled = True
+        roundtable_moderator = {
+            "id": "moderator-1",
+            "name": "主持人",
+            "llm_base_url": "https://example.com/v1",
+            "llm_api_key": "sk-moderator",
+            "llm_model": "gpt-5.4",
+            "enabled": True,
+        }
+        roundtable_participants = [
+            {
+                "id": "p1",
+                "name": "AI 1",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "sk-p1",
+                "llm_model": "gpt-4o-mini",
+                "enabled": True,
+            },
+            {
+                "id": "p2",
+                "name": "AI 2",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "sk-p2",
+                "llm_model": "gpt-4.1-mini",
+                "enabled": True,
+            },
+        ]
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: StubSettings(),
+    )
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        headers = _auth_headers(client)
+        response = client.post(
+            "/api/aniu/chat",
+            json={"messages": [{"role": "user", "content": "帮我分析市场"}]},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "圆桌会议纪要" in payload["message"]["content"]
+    assert "AI 1" in payload["message"]["content"]
+    assert "AI 2" in payload["message"]["content"]
+    assert "主持人总结" in payload["message"]["content"]
+    assert payload["roundtable"]["enabled"] is True
+    assert calls == ["gpt-4o-mini", "gpt-4.1-mini", "gpt-5.4"]
+
     database_module._engine = None
     database_module._session_local = None
     get_settings.cache_clear()

@@ -40,6 +40,91 @@
             </label>
             <div class="field field-checkbox">
               <label class="checkbox-row">
+                <input v-model="settings.roundtable_enabled" type="checkbox" />
+                <span>启用多 AI 圆桌会议</span>
+              </label>
+              <p class="field-help">仅影响分析 / 聊天模式。自动交易执行链路继续保持单模型。</p>
+            </div>
+            <template v-if="settings.roundtable_enabled && settings.roundtable_moderator">
+              <div class="field">
+                <span>主持人</span>
+                <div class="settings-inline-fields">
+                  <label class="field">
+                    <span>名称</span>
+                    <input v-model="settings.roundtable_moderator.name" placeholder="主持人" />
+                  </label>
+                  <label class="field">
+                    <span>模型名</span>
+                    <input v-model="settings.roundtable_moderator.llm_model" placeholder="gpt-4o-mini" />
+                  </label>
+                </div>
+                <div class="settings-inline-fields">
+                  <label class="field">
+                    <span>Base URL</span>
+                    <input v-model="settings.roundtable_moderator.llm_base_url" placeholder="默认可留空并继承主配置" />
+                  </label>
+                  <label class="field">
+                    <span>API Key</span>
+                    <input v-model="settings.roundtable_moderator.llm_api_key" type="password" placeholder="默认可留空并继承主配置" />
+                  </label>
+                </div>
+              </div>
+              <div class="field">
+                <div class="settings-array-head">
+                  <span>参与者</span>
+                  <button type="button" class="button ghost small soft-header-button" @click="addRoundtableParticipant">
+                    新增参与者
+                  </button>
+                </div>
+                <div v-if="settings.roundtable_participants.length" class="settings-array-list">
+                  <article
+                    v-for="(participant, index) in settings.roundtable_participants"
+                    :key="participant.id || index"
+                    class="settings-array-card"
+                  >
+                    <div class="settings-array-head">
+                      <strong>参与者 {{ index + 1 }}</strong>
+                      <button
+                        type="button"
+                        class="button ghost small soft-header-button"
+                        :disabled="settings.roundtable_participants.length <= 2"
+                        @click="removeRoundtableParticipant(index)"
+                      >
+                        删除
+                      </button>
+                    </div>
+                    <div class="field field-checkbox">
+                      <label class="checkbox-row">
+                        <input v-model="participant.enabled" type="checkbox" />
+                        <span>启用该参与者</span>
+                      </label>
+                    </div>
+                    <div class="settings-inline-fields">
+                      <label class="field">
+                        <span>名称</span>
+                        <input v-model="participant.name" :placeholder="`AI ${index + 1}`" />
+                      </label>
+                      <label class="field">
+                        <span>模型名</span>
+                        <input v-model="participant.llm_model" placeholder="gpt-4o-mini" />
+                      </label>
+                    </div>
+                    <div class="settings-inline-fields">
+                      <label class="field">
+                        <span>Base URL</span>
+                        <input v-model="participant.llm_base_url" placeholder="默认可留空并继承主配置" />
+                      </label>
+                      <label class="field">
+                        <span>API Key</span>
+                        <input v-model="participant.llm_api_key" type="password" placeholder="默认可留空并继承主配置" />
+                      </label>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </template>
+            <div class="field field-checkbox">
+              <label class="checkbox-row">
                 <input v-model="settings.operation_notify_enabled" type="checkbox" />
                 <span>执行任务后发送通知</span>
               </label>
@@ -252,7 +337,7 @@ import { storeToRefs } from 'pinia'
 
 import { useSkillManager } from '@/composables/useSkillManager'
 import { useAppStore } from '@/stores/legacy'
-import type { SkillListItem } from '@/types'
+import type { RoundtableModelConfig, SkillListItem } from '@/types'
 
 const store = useAppStore()
 const { settings, busy, errorMessage } = storeToRefs(store)
@@ -273,6 +358,36 @@ const {
   deleteSkill: deleteManagedSkill,
 } = useSkillManager()
 const skillArchiveInputRef = ref<HTMLInputElement | null>(null)
+
+function createRoundtableParticipant(overrides?: Partial<RoundtableModelConfig>): RoundtableModelConfig {
+  const id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+  return {
+    id,
+    name: '',
+    llm_base_url: '',
+    llm_api_key: '',
+    llm_model: 'gpt-4o-mini',
+    enabled: true,
+    ...overrides,
+  }
+}
+
+function addRoundtableParticipant() {
+  settings.value.roundtable_participants.push(
+    createRoundtableParticipant({
+      name: `AI ${settings.value.roundtable_participants.length + 1}`,
+    }),
+  )
+}
+
+function removeRoundtableParticipant(index: number) {
+  if (settings.value.roundtable_participants.length <= 2) {
+    return
+  }
+  settings.value.roundtable_participants.splice(index, 1)
+}
 
 function openImportFileDialog() {
   if (skillArchiveInputRef.value) {

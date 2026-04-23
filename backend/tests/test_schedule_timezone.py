@@ -1326,6 +1326,109 @@ def test_execute_run_sends_wecom_notification_after_failure(monkeypatch, tmp_pat
     assert "错误: llm boom" in str(captured["body"])
 
 
+def test_execute_run_uses_roundtable_for_analysis_mode(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请分析当前账户。",
+                "roundtable_enabled": True,
+                "roundtable_moderator": {
+                    "id": "moderator-1",
+                    "name": "主持人",
+                    "llm_base_url": "https://example.com/v1",
+                    "llm_api_key": "token-moderator",
+                    "llm_model": "demo-host",
+                    "enabled": True,
+                },
+                "roundtable_participants": [
+                    {
+                        "id": "p1",
+                        "name": "AI 1",
+                        "llm_base_url": "https://example.com/v1",
+                        "llm_api_key": "token-1",
+                        "llm_model": "demo-a",
+                        "enabled": True,
+                    },
+                    {
+                        "id": "p2",
+                        "name": "AI 2",
+                        "llm_base_url": "https://example.com/v1",
+                        "llm_api_key": "token-2",
+                        "llm_model": "demo-b",
+                        "enabled": True,
+                    },
+                ],
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del client, messages, emit
+        captured.setdefault("participant_models", []).append(app_settings.llm_model)
+        return (
+            {
+                "final_answer": f"{app_settings.llm_model} 的观点",
+                "tool_calls": [],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    def fake_chat(*, model, base_url, api_key, system_prompt, messages, timeout_seconds=60, tool_context=None, emit=None, cancel_event=None):
+        del base_url, api_key, messages, timeout_seconds, tool_context, emit, cancel_event
+        captured["moderator_model"] = model
+        captured["moderator_prompt"] = system_prompt
+        return "综合结论：保持观察。"
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "chat",
+        fake_chat,
+    )
+
+    run = aniu_service.execute_run(trigger_source="manual")
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert "圆桌会议纪要" in str(run.final_answer)
+    assert "主持人总结" in str(run.final_answer)
+    assert captured["participant_models"] == ["demo-a", "demo-b"]
+    assert captured["moderator_model"] == "demo-host"
+
+
 def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> None:
     _use_temp_db(monkeypatch, tmp_path)
     init_db()

@@ -85,6 +85,16 @@ def _ensure_app_settings_columns(engine) -> None:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN automation_idle_summary_hours INTEGER DEFAULT 12"
         )
+    if "roundtable_enabled" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN roundtable_enabled BOOLEAN DEFAULT 0"
+        )
+    if "roundtable_moderator" not in columns:
+        statements.append("ALTER TABLE app_settings ADD COLUMN roundtable_moderator JSON")
+    if "roundtable_participants" not in columns:
+        statements.append(
+            "ALTER TABLE app_settings ADD COLUMN roundtable_participants JSON DEFAULT '[]'"
+        )
     if "operation_notify_enabled" not in columns:
         statements.append(
             "ALTER TABLE app_settings ADD COLUMN operation_notify_enabled BOOLEAN DEFAULT 0"
@@ -121,6 +131,8 @@ def _ensure_app_settings_columns(engine) -> None:
                 "ELSE automation_context_window_tokens END, "
                 "automation_recent_message_limit = COALESCE(automation_recent_message_limit, 24), "
                 "automation_enable_auto_compaction = COALESCE(automation_enable_auto_compaction, 1), "
+                "roundtable_enabled = COALESCE(roundtable_enabled, 0), "
+                "roundtable_participants = COALESCE(roundtable_participants, '[]'), "
                 "operation_notify_enabled = COALESCE(operation_notify_enabled, 0), "
                 "bark_server_url = COALESCE(NULLIF(trim(bark_server_url), ''), 'https://api.day.app'), "
                 "automation_idle_summary_hours = COALESCE(automation_idle_summary_hours, 12), "

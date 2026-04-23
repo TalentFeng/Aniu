@@ -14,6 +14,15 @@ def _mask_key(value: str | None) -> str | None:
     return value[:3] + "****" + value[-4:]
 
 
+class RoundtableModelConfig(BaseModel):
+    id: str | None = Field(default=None, max_length=128)
+    name: str = Field(min_length=1, max_length=64)
+    llm_base_url: str | None = Field(default=None, max_length=512)
+    llm_api_key: str | None = Field(default=None, max_length=512)
+    llm_model: str = Field(default="gpt-4o-mini", max_length=128)
+    enabled: bool = True
+
+
 class AppSettingsBase(BaseModel):
     provider_name: str = "openai-compatible"
     mx_api_key: str | None = Field(default=None, max_length=512)
@@ -26,6 +35,9 @@ class AppSettingsBase(BaseModel):
     automation_recent_message_limit: int = Field(default=24, ge=4, le=200)
     automation_enable_auto_compaction: bool = True
     automation_idle_summary_hours: int = Field(default=12, ge=1, le=168)
+    roundtable_enabled: bool = False
+    roundtable_moderator: RoundtableModelConfig | None = None
+    roundtable_participants: list[RoundtableModelConfig] = Field(default_factory=list)
     operation_notify_enabled: bool = False
     operation_notify_channel: Literal["bark", "wecom"] | None = None
     bark_server_url: str | None = Field(default="https://api.day.app", max_length=512)
@@ -44,6 +56,12 @@ class AppSettingsRead(AppSettingsBase):
     def mask_sensitive_fields(self) -> "AppSettingsRead":
         self.mx_api_key = _mask_key(self.mx_api_key)
         self.llm_api_key = _mask_key(self.llm_api_key)
+        if self.roundtable_moderator is not None:
+            self.roundtable_moderator.llm_api_key = _mask_key(
+                self.roundtable_moderator.llm_api_key
+            )
+        for participant in self.roundtable_participants:
+            participant.llm_api_key = _mask_key(participant.llm_api_key)
         self.bark_device_key = _mask_key(self.bark_device_key)
         self.wecom_webhook_url = _mask_key(self.wecom_webhook_url)
         return self
@@ -349,6 +367,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     message: ChatMessage
     context: dict[str, bool]
+    roundtable: dict[str, Any] | None = None
 
 
 class ChatStreamRequest(BaseModel):

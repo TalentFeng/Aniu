@@ -35,6 +35,7 @@ from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.skills.providers import build_skill_context
 from app.services.event_bus import event_bus, make_emitter
 from app.services.llm_service import LLMStreamCancelled, llm_service
+from app.services.roundtable_service import roundtable_service
 from app.services.run_notification_service import run_notification_service
 from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
@@ -97,6 +98,48 @@ def _parse_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _contains_masked_secret(value: Any) -> bool:
+    return isinstance(value, str) and "****" in value
+
+
+def _merge_masked_roundtable_moderator(
+    current: Any,
+    new_value: Any,
+) -> Any:
+    if not isinstance(new_value, dict):
+        return new_value
+    merged = dict(new_value)
+    if _contains_masked_secret(merged.get("llm_api_key")) and isinstance(current, dict):
+        merged["llm_api_key"] = current.get("llm_api_key")
+    return merged
+
+
+def _merge_masked_roundtable_participants(
+    current: Any,
+    new_value: Any,
+) -> Any:
+    if not isinstance(new_value, list):
+        return new_value
+    current_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(current, list):
+        for item in current:
+            if isinstance(item, dict):
+                key = str(item.get("id") or "").strip()
+                if key:
+                    current_by_id[key] = item
+
+    merged_items: list[dict[str, Any]] = []
+    for item in new_value:
+        if not isinstance(item, dict):
+            continue
+        merged = dict(item)
+        key = str(merged.get("id") or "").strip()
+        if _contains_masked_secret(merged.get("llm_api_key")) and key and key in current_by_id:
+            merged["llm_api_key"] = current_by_id[key].get("llm_api_key")
+        merged_items.append(merged)
+    return merged_items
 
 
 def _normalize_percent(value: float | None) -> float | None:
@@ -366,6 +409,16 @@ class AniuService:
             if field in sensitive_fields:
                 if isinstance(value, str) and "****" in value:
                     continue
+            if field == "roundtable_moderator":
+                value = _merge_masked_roundtable_moderator(
+                    getattr(instance, field, None),
+                    value,
+                )
+            elif field == "roundtable_participants":
+                value = _merge_masked_roundtable_participants(
+                    getattr(instance, field, None),
+                    value,
+                )
             old_value = getattr(instance, field, None)
             if old_value != value:
                 changed_fields.append(field)
@@ -1372,22 +1425,33 @@ class AniuService:
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
 
-        if not settings.llm_base_url or not settings.llm_api_key:
+        if (
+            not roundtable_service.is_enabled(settings)
+            and (not settings.llm_base_url or not settings.llm_api_key)
+        ):
             raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 
         messages = [
             {"role": item.role, "content": item.content} for item in payload.messages
         ]
 
-        content = llm_service.chat(
-            model=settings.llm_model,
-            base_url=str(settings.llm_base_url),
-            api_key=str(settings.llm_api_key),
-            system_prompt=settings.system_prompt,
-            messages=messages,
-            timeout_seconds=1800,
-            tool_context=build_skill_context(run_type="chat", app_settings=settings),
-        )
+        roundtable_payload: dict[str, Any] | None = None
+        if roundtable_service.is_enabled(settings):
+            roundtable_payload = roundtable_service.run_chat_roundtable(
+                settings=settings,
+                messages=messages,
+            )
+            content = str(roundtable_payload.get("content") or "").strip()
+        else:
+            content = llm_service.chat(
+                model=settings.llm_model,
+                base_url=str(settings.llm_base_url),
+                api_key=str(settings.llm_api_key),
+                system_prompt=settings.system_prompt,
+                messages=messages,
+                timeout_seconds=1800,
+                tool_context=build_skill_context(run_type="chat", app_settings=settings),
+            )
 
         return {
             "message": {
@@ -1401,6 +1465,7 @@ class AniuService:
                 "tool_access_orders": True,
                 "tool_access_runs": True,
             },
+            "roundtable": roundtable_payload.get("roundtable") if roundtable_payload else None,
         }
 
     def chat_stream(self, payload: ChatRequest) -> Iterator[dict[str, Any]]:
@@ -1411,7 +1476,10 @@ class AniuService:
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
 
-        if not settings.llm_base_url or not settings.llm_api_key:
+        if (
+            not roundtable_service.is_enabled(settings)
+            and (not settings.llm_base_url or not settings.llm_api_key)
+        ):
             raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 
         messages = [
@@ -1423,6 +1491,9 @@ class AniuService:
             llm_model=settings.llm_model,
             llm_base_url=str(settings.llm_base_url),
             llm_api_key=str(settings.llm_api_key),
+            roundtable_enabled=getattr(settings, "roundtable_enabled", False),
+            roundtable_moderator=getattr(settings, "roundtable_moderator", None),
+            roundtable_participants=getattr(settings, "roundtable_participants", None),
         )
 
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -1435,20 +1506,29 @@ class AniuService:
 
         def _worker() -> None:
             try:
-                content = llm_service.chat(
-                    model=settings_snapshot.llm_model,
-                    base_url=settings_snapshot.llm_base_url,
-                    api_key=settings_snapshot.llm_api_key,
-                    system_prompt=settings_snapshot.system_prompt,
-                    messages=messages,
-                    timeout_seconds=180,
-                    tool_context=build_skill_context(
-                        run_type="chat",
-                        app_settings=settings_snapshot,
-                    ),
-                    emit=_emit,
-                    cancel_event=cancel_event,
-                )
+                if roundtable_service.is_enabled(settings_snapshot):
+                    result = roundtable_service.run_chat_roundtable(
+                        settings=settings_snapshot,
+                        messages=messages,
+                        emit=_emit,
+                        cancel_event=cancel_event,
+                    )
+                    content = str(result.get("content") or "").strip()
+                else:
+                    content = llm_service.chat(
+                        model=settings_snapshot.llm_model,
+                        base_url=settings_snapshot.llm_base_url,
+                        api_key=settings_snapshot.llm_api_key,
+                        system_prompt=settings_snapshot.system_prompt,
+                        messages=messages,
+                        timeout_seconds=180,
+                        tool_context=build_skill_context(
+                            run_type="chat",
+                            app_settings=settings_snapshot,
+                        ),
+                        emit=_emit,
+                        cancel_event=cancel_event,
+                    )
                 _emit("completed", message=content)
             except LLMStreamCancelled:
                 logger.info("chat_stream worker cancelled")
@@ -1785,6 +1865,9 @@ class AniuService:
                     "automation_idle_summary_hours",
                     AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS,
                 ),
+                "roundtable_enabled": getattr(settings, "roundtable_enabled", False),
+                "roundtable_moderator": getattr(settings, "roundtable_moderator", None),
+                "roundtable_participants": getattr(settings, "roundtable_participants", None),
                 "operation_notify_enabled": getattr(
                     settings, "operation_notify_enabled", False
                 ),
@@ -1848,14 +1931,27 @@ class AniuService:
                     trigger_source=trigger_source,
                     schedule_id=schedule_id,
                 )
-                decision, llm_request, llm_response, runtime_trace = (
-                    llm_service.run_agent_with_messages(
-                        app_settings=settings,
-                        client=client,
-                        messages=session_context.messages,
-                        emit=_emit,
+                if (
+                    str(getattr(settings, "run_type", "analysis") or "analysis") == "analysis"
+                    and roundtable_service.is_enabled(settings)
+                ):
+                    decision, llm_request, llm_response, runtime_trace = (
+                        roundtable_service.run_analysis_roundtable(
+                            settings=settings,
+                            client=client,
+                            messages=session_context.messages,
+                            emit=_emit,
+                        )
                     )
-                )
+                else:
+                    decision, llm_request, llm_response, runtime_trace = (
+                        llm_service.run_agent_with_messages(
+                            app_settings=settings,
+                            client=client,
+                            messages=session_context.messages,
+                            emit=_emit,
+                        )
+                    )
             finally:
                 client.close()
 
