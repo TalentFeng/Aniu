@@ -28,6 +28,7 @@
                   </button>
                 </div>
                 <button
+                  type="button"
                   class="button ghost small soft-header-button overview-refresh-button"
                   :class="{ 'is-loading': manualRunning && activeManualAction === 'analysis' }"
                   :disabled="manualRunning"
@@ -37,6 +38,7 @@
                   {{ manualRunning && activeManualAction === 'analysis' ? '执行中…' : analysisRunButtonText }}
                 </button>
                 <button
+                  type="button"
                   class="button ghost small soft-header-button overview-refresh-button manual-trade-button"
                   :class="{ 'is-loading': manualRunning && activeManualAction === 'trade' }"
                   :disabled="manualRunning"
@@ -49,6 +51,7 @@
             </div>
 
             <div v-if="analysisError" class="error-banner">{{ analysisError }}</div>
+            <div v-if="manualRunLaunchError" class="error-banner">{{ manualRunLaunchError }}</div>
 
             <div class="runs-container">
               <!-- 今日运行 - 方块网格 -->
@@ -369,6 +372,7 @@ const {
 
 const activeManualAction = ref<'analysis' | 'trade' | null>(null)
 const analysisMode = ref<'single' | 'roundtable'>('single')
+const manualRunLaunchError = ref('')
 
 const livePlaceholderVisible = computed(() => {
   if (!liveActive.value) return false
@@ -419,6 +423,7 @@ async function startManualRun(options: {
   if (manualRunning.value) return
   const startedAt = Date.now()
   manualRunning.value = true
+  manualRunLaunchError.value = ''
   activeManualAction.value = options.action
   liveFocused.value = true
   try {
@@ -431,10 +436,19 @@ async function startManualRun(options: {
     })
   } catch (error) {
     console.error('[TasksView] manual run failed', error)
+    manualRunLaunchError.value = getManualRunLaunchErrorMessage(error, options.action)
     manualRunning.value = false
     activeManualAction.value = null
     liveFocused.value = false
   }
+}
+
+function getManualRunLaunchErrorMessage(error: unknown, action: 'analysis' | 'trade'): string {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  return action === 'trade' ? '交易任务启动失败，请稍后重试。' : '分析任务启动失败，请稍后重试。'
 }
 
 async function handleManualRun() {
