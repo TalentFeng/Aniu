@@ -2311,6 +2311,16 @@ class AniuService:
         finally:
             self._run_lock.release()
 
+    def _get_active_run_id(self) -> int | None:
+        with session_scope() as db:
+            run = (
+                db.query(StrategyRun)
+                .filter(StrategyRun.status.in_(["running", "pending"]))
+                .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
+                .first()
+            )
+            return run.id if run else None
+
     def start_run_async(
         self,
         trigger_source: str = "manual",
@@ -2323,6 +2333,9 @@ class AniuService:
         Event stream: subscribe via ``event_bus`` using the returned run_id.
         """
         if not self._run_lock.acquire(blocking=False):
+            active_run_id = self._get_active_run_id()
+            if active_run_id is not None:
+                return active_run_id
             raise RuntimeError("已有运行中的任务，请稍后再试。")
 
         run_id: int | None = None

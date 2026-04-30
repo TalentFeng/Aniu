@@ -267,6 +267,39 @@ def test_run_stream_endpoint_passes_analysis_mode(monkeypatch, tmp_path) -> None
     get_settings.cache_clear()
 
 
+def test_run_stream_endpoint_returns_active_run_when_busy(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            run = StrategyRun(
+                trigger_source="manual",
+                run_type="analysis",
+                status="running",
+            )
+            db.add(run)
+            db.flush()
+            run_id = run.id
+
+        acquired = aniu_service._run_lock.acquire(blocking=False)
+        assert acquired is True
+        try:
+            headers = _auth_headers(client)
+            response = client.post(
+                "/api/aniu/run-stream?run_type=analysis&analysis_mode=roundtable",
+                headers=headers,
+            )
+        finally:
+            aniu_service._run_lock.release()
+
+        assert response.status_code == 200
+        assert response.json()["run_id"] == run_id
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
 def test_app_startup_requires_current_year_trading_calendar(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
     monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
