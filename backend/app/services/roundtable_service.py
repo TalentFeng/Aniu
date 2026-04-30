@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -7,6 +8,8 @@ from typing import Any
 from skills.mx_core.client import MXClient
 
 from app.services.llm_service import llm_service
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -65,6 +68,7 @@ class RoundtableService:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
+                logger.warning("roundtable participant %s failed: %s", participant.name, exc)
                 failures.append(
                     {
                         "id": participant.id,
@@ -203,6 +207,7 @@ class RoundtableService:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
+                logger.warning("roundtable participant %s failed: %s", participant.name, exc)
                 failures.append(
                     {
                         "id": participant.id,
