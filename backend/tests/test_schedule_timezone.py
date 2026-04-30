@@ -1257,6 +1257,44 @@ def test_execute_run_sends_bark_notification_after_completion(monkeypatch, tmp_p
     assert "保持观察。保持观察。保持观察。" in str(captured["body"])
 
 
+def test_bark_payload_keeps_full_message_available(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import run_notification_service as notification_module
+
+    captured: dict[str, object] = {}
+
+    def fake_post_json(url: str, payload: dict[str, object]) -> None:
+        captured["url"] = url
+        captured["payload"] = payload
+
+    monkeypatch.setattr(
+        notification_module.run_notification_service,
+        "_post_json",
+        fake_post_json,
+    )
+
+    notification_module.run_notification_service._send_bark(
+        config=notification_module.RunNotificationConfig(
+            enabled=True,
+            channel="bark",
+            bark_server_url="https://api.day.app",
+            bark_device_key="device-key",
+            wecom_webhook_url=None,
+        ),
+        title="Aniu 任务完成",
+        body="完整正文" * 40,
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["copy"] == "完整正文" * 40
+    assert payload["isArchive"] == "1"
+
+    _reset_db_state()
+
+
 def test_execute_run_sends_wecom_notification_after_failure(monkeypatch, tmp_path) -> None:
     _use_temp_db(monkeypatch, tmp_path)
     init_db()
@@ -1428,6 +1466,39 @@ def test_execute_run_uses_roundtable_for_analysis_mode(monkeypatch, tmp_path) ->
     assert "主持人总结" in str(run.final_answer)
     assert captured["participant_models"] == ["demo-a", "demo-b"]
     assert captured["moderator_model"] == "demo-host"
+
+
+def test_execute_run_roundtable_mode_requires_complete_roundtable_config(monkeypatch, tmp_path) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    monkeypatch.setattr(
+        aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "roundtable_enabled": False,
+                "roundtable_moderator": None,
+                "roundtable_participants": [],
+            },
+        )(),
+    )
+
+    with pytest.raises(RuntimeError, match="圆桌派未配置完成"):
+        aniu_service.execute_run(
+            trigger_source="manual",
+            manual_analysis_mode="roundtable",
+        )
+
+    _reset_db_state()
 
 
 def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> None:

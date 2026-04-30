@@ -1808,6 +1808,7 @@ class AniuService:
         trigger_source: str,
         schedule_id: int | None,
         manual_run_type: str | None = None,
+        manual_analysis_mode: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         with session_scope() as db:
             settings = self.get_or_create_settings(db)
@@ -1820,9 +1821,26 @@ class AniuService:
                 settings=settings,
                 manual_run_type=manual_run_type,
             )
+            resolved_run_type = (
+                schedule.run_type if schedule else manual_resolved_run_type
+            )
+            roundtable_enabled = bool(getattr(settings, "roundtable_enabled", False))
+            if resolved_run_type != "analysis":
+                roundtable_enabled = False
+            elif manual_analysis_mode == "single":
+                roundtable_enabled = False
+            elif manual_analysis_mode == "roundtable":
+                roundtable_enabled = True
+                validation_settings = SimpleNamespace(
+                    roundtable_enabled=True,
+                    roundtable_moderator=getattr(settings, "roundtable_moderator", None),
+                    roundtable_participants=getattr(settings, "roundtable_participants", None),
+                )
+                if not roundtable_service.is_enabled(validation_settings):
+                    raise RuntimeError("圆桌派未配置完成，请先在功能设置中配置主持人和至少 2 个启用参与者。")
             run = StrategyRun(
                 trigger_source=trigger_source,
-                run_type=schedule.run_type if schedule else manual_resolved_run_type,
+                run_type=resolved_run_type,
                 schedule_id=schedule.id if schedule else None,
                 schedule_name=schedule.name if schedule else None,
                 status="running",
@@ -1836,7 +1854,12 @@ class AniuService:
                 "llm_base_url": settings.llm_base_url,
                 "llm_api_key": settings.llm_api_key,
                 "llm_model": settings.llm_model,
-                "run_type": schedule.run_type if schedule else manual_resolved_run_type,
+                "run_type": resolved_run_type,
+                "analysis_mode": (
+                    manual_analysis_mode
+                    if resolved_run_type == "analysis" and manual_analysis_mode in {"single", "roundtable"}
+                    else "default"
+                ),
                 "schedule_id": schedule.id if schedule else None,
                 "schedule_name": schedule.name if schedule else None,
                 "system_prompt": settings.system_prompt,
@@ -1865,7 +1888,7 @@ class AniuService:
                     "automation_idle_summary_hours",
                     AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS,
                 ),
-                "roundtable_enabled": getattr(settings, "roundtable_enabled", False),
+                "roundtable_enabled": roundtable_enabled,
                 "roundtable_moderator": getattr(settings, "roundtable_moderator", None),
                 "roundtable_participants": getattr(settings, "roundtable_participants", None),
                 "operation_notify_enabled": getattr(
@@ -2268,6 +2291,7 @@ class AniuService:
         trigger_source: str = "manual",
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
+        manual_analysis_mode: str | None = None,
     ) -> StrategyRun:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("已有运行中的任务，请稍后再试。")
@@ -2276,6 +2300,7 @@ class AniuService:
                 trigger_source,
                 schedule_id,
                 manual_run_type,
+                manual_analysis_mode,
             )
             return self._run_body(
                 run_id=run_id,
@@ -2291,6 +2316,7 @@ class AniuService:
         trigger_source: str = "manual",
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
+        manual_analysis_mode: str | None = None,
     ) -> int:
         """Launch a run on a background thread and return its run_id immediately.
 
@@ -2305,6 +2331,7 @@ class AniuService:
                 trigger_source,
                 schedule_id,
                 manual_run_type,
+                manual_analysis_mode,
             )
         except Exception:
             self._run_lock.release()

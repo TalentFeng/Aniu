@@ -217,6 +217,7 @@ def update_schedule(
 def run_once(
     schedule_id: int | None = Query(default=None, ge=1),
     run_type: Literal["analysis", "trade"] | None = Query(default=None),
+    analysis_mode: Literal["single", "roundtable"] | None = Query(default=None),
     _user: str = Depends(get_current_user),
 ) -> RunDetailRead:
     try:
@@ -224,6 +225,7 @@ def run_once(
             trigger_source="manual",
             schedule_id=schedule_id,
             manual_run_type=run_type,
+            manual_analysis_mode=analysis_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -235,6 +237,7 @@ def run_once(
 def run_stream(
     schedule_id: int | None = Query(default=None, ge=1),
     run_type: Literal["analysis", "trade"] | None = Query(default=None),
+    analysis_mode: Literal["single", "roundtable"] | None = Query(default=None),
     _user: str = Depends(get_current_user),
 ) -> dict:
     """Launch a run in the background and return run_id immediately.
@@ -246,6 +249,7 @@ def run_stream(
             trigger_source="manual",
             schedule_id=schedule_id,
             manual_run_type=run_type,
+            manual_analysis_mode=analysis_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

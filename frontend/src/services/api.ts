@@ -284,13 +284,16 @@ export const api = {
       body: JSON.stringify(payload),
     })
   },
-  runNow(scheduleId?: number, runType?: 'analysis' | 'trade') {
+  runNow(scheduleId?: number, runType?: 'analysis' | 'trade', analysisMode?: 'single' | 'roundtable') {
     const params = new URLSearchParams()
     if (typeof scheduleId === 'number') {
       params.set('schedule_id', String(scheduleId))
     }
     if (runType) {
       params.set('run_type', runType)
+    }
+    if (analysisMode && (!runType || runType === 'analysis')) {
+      params.set('analysis_mode', analysisMode)
     }
     const suffix = params.size > 0 ? `?${params.toString()}` : ''
     return request<RunDetail>(`${API_PREFIX}/run${suffix}`, {
@@ -298,13 +301,16 @@ export const api = {
       timeoutMs: 10 * 60 * 1000,
     })
   },
-  runNowStream(scheduleId?: number, runType?: 'analysis' | 'trade') {
+  runNowStream(scheduleId?: number, runType?: 'analysis' | 'trade', analysisMode?: 'single' | 'roundtable') {
     const params = new URLSearchParams()
     if (typeof scheduleId === 'number') {
       params.set('schedule_id', String(scheduleId))
     }
     if (runType) {
       params.set('run_type', runType)
+    }
+    if (analysisMode && (!runType || runType === 'analysis')) {
+      params.set('analysis_mode', analysisMode)
     }
     const suffix = params.size > 0 ? `?${params.toString()}` : ''
     return request<{ run_id: number }>(`${API_PREFIX}/run-stream${suffix}`, {

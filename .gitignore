@@ -61,6 +61,13 @@ backend/data/skill_workspace/
 
 # Local tool config
 .claude/
+.idea
+.trellis
+.codex
+.agents
+AGENTS.md
+CLAUDE.md
+.venv
 
 # Local notes / scratch files
 /bug-indexed-cupcake.md
@@ -69,3 +76,4 @@ backend/data/skill_workspace/
 # Personal local scripts
 /dev.bat
 /setup.bat
+.gitnexus

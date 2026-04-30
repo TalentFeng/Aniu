@@ -230,6 +230,38 @@ def test_run_stream_endpoint_passes_manual_trade_run_type(monkeypatch, tmp_path)
     assert captured["schedule_id"] is None
     assert captured["manual_run_type"] == "trade"
 
+
+def test_run_stream_endpoint_passes_analysis_mode(monkeypatch, tmp_path) -> None:
+    from app.services.aniu_service import aniu_service
+
+    captured: dict[str, object] = {}
+
+    def fake_start_run_async(**kwargs):
+        captured.update(kwargs)
+        return 101
+
+    monkeypatch.setattr(aniu_service, "start_run_async", fake_start_run_async)
+    monkeypatch.setenv("APP_LOGIN_PASSWORD", "release-pass")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(trading_calendar_service, "ensure_years", lambda years: None)
+    monkeypatch.setattr(scheduler_service, "start", lambda: None)
+    monkeypatch.setattr(scheduler_service, "stop", lambda: None)
+    get_settings.cache_clear()
+    database_module._engine = None
+    database_module._session_local = None
+    rate_limit_module._limiter.reset()
+    app = create_app()
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _auth_headers(client)
+        response = client.post("/api/aniu/run-stream?run_type=analysis&analysis_mode=roundtable", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == 101
+    assert captured["trigger_source"] == "manual"
+    assert captured["manual_run_type"] == "analysis"
+    assert captured["manual_analysis_mode"] == "roundtable"
+
     database_module._engine = None
     database_module._session_local = None
     get_settings.cache_clear()

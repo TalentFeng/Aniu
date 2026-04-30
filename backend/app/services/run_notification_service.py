@@ -129,6 +129,8 @@ class RunNotificationService:
             "device_key": config.bark_device_key,
             "title": title,
             "body": body,
+            "copy": body,
+            "isArchive": "1",
         }
         self._post_json(f"{server_url}/push", payload)
 

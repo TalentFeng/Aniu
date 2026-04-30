@@ -5,10 +5,28 @@
           <section class="panel run-grid-panel">
             <div class="panel-head">
               <div class="head-main">
-                <h2>运行记录</h2>
-                <p class="section-kicker">Run History</p>
+                <h2>分析实验室</h2>
+                <p class="section-kicker">Analysis Lab</p>
               </div>
               <div class="panel-head-actions">
+                <div class="analysis-mode-toggle" role="tablist" aria-label="分析模式">
+                  <button
+                    type="button"
+                    class="button ghost small soft-header-button"
+                    :class="{ active: analysisMode === 'single' }"
+                    @click="analysisMode = 'single'"
+                  >
+                    普通分析
+                  </button>
+                  <button
+                    type="button"
+                    class="button ghost small soft-header-button"
+                    :class="{ active: analysisMode === 'roundtable' }"
+                    @click="analysisMode = 'roundtable'"
+                  >
+                    圆桌派
+                  </button>
+                </div>
                 <button
                   class="button ghost small soft-header-button overview-refresh-button"
                   :class="{ 'is-loading': manualRunning && activeManualAction === 'analysis' }"
@@ -16,7 +34,7 @@
                   :title="manualRunButtonTitle"
                   @click="handleManualRun"
                 >
-                  {{ manualRunning && activeManualAction === 'analysis' ? '执行中…' : '执行分析' }}
+                  {{ manualRunning && activeManualAction === 'analysis' ? '执行中…' : analysisRunButtonText }}
                 </button>
                 <button
                   class="button ghost small soft-header-button overview-refresh-button manual-trade-button"
@@ -350,6 +368,7 @@ const {
 } = runStream
 
 const activeManualAction = ref<'analysis' | 'trade' | null>(null)
+const analysisMode = ref<'single' | 'roundtable'>('single')
 
 const livePlaceholderVisible = computed(() => {
   if (!liveActive.value) return false
@@ -362,13 +381,12 @@ const preMarketScheduleId = computed(() => {
   return match?.id ?? null
 })
 
-const manualRunTypeText = computed(() => {
-  const match = preMarketScheduleId.value === null
-    ? null
-    : store.schedules.find((item) => item.id === preMarketScheduleId.value)
-
-  return match?.run_type === 'trade' ? '交易任务' : '分析任务'
-})
+const manualRunTypeText = computed(() => (
+  analysisMode.value === 'roundtable' ? '圆桌派分析' : '普通分析'
+))
+const analysisRunButtonText = computed(() => (
+  analysisMode.value === 'roundtable' ? '执行圆桌派' : '执行分析'
+))
 
 const tradeScheduleId = computed(() => {
   const match = store.schedules.find((item) => item.run_type === 'trade')
@@ -379,8 +397,10 @@ const manualTradeRunTypeText = computed(() => '交易任务')
 
 const manualRunButtonTitle = computed(() =>
   preMarketScheduleId.value === null
-    ? '未找到盘前分析任务，将使用默认调度执行'
-    : '手动执行一次盘前分析',
+    ? (analysisMode.value === 'roundtable'
+      ? '未找到盘前分析任务，将使用默认模板执行圆桌派分析'
+      : '未找到盘前分析任务，将使用默认调度执行')
+    : (analysisMode.value === 'roundtable' ? '手动执行一次圆桌派分析' : '手动执行一次盘前分析'),
 )
 
 const manualTradeButtonTitle = computed(() =>
@@ -392,6 +412,7 @@ const manualTradeButtonTitle = computed(() =>
 async function startManualRun(options: {
   scheduleId?: number
   runType?: 'analysis' | 'trade'
+  analysisMode?: 'single' | 'roundtable'
   action: 'analysis' | 'trade'
   runTypeLabel: string
 }) {
@@ -401,7 +422,7 @@ async function startManualRun(options: {
   activeManualAction.value = options.action
   liveFocused.value = true
   try {
-    const { run_id } = await api.runNowStream(options.scheduleId, options.runType)
+    const { run_id } = await api.runNowStream(options.scheduleId, options.runType, options.analysisMode)
     runStream.start(run_id, {
       startedAt,
       runTypeLabel: options.runTypeLabel,
@@ -419,6 +440,8 @@ async function startManualRun(options: {
 async function handleManualRun() {
   await startManualRun({
     scheduleId: preMarketScheduleId.value ?? undefined,
+    runType: 'analysis',
+    analysisMode: analysisMode.value,
     action: 'analysis',
     runTypeLabel: manualRunTypeText.value,
   })
@@ -982,6 +1005,18 @@ onBeforeUnmount(() => {
 <style scoped>
 .manual-trade-button {
   margin-left: 5px;
+}
+
+.analysis-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+}
+
+.analysis-mode-toggle .button.active {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f8fbff;
 }
 
 .compact-item-button {
