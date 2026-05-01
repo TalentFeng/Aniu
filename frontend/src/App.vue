@@ -38,7 +38,7 @@
     <div v-if="!isLoginPage" class="tabs-container">
       <nav class="app-header-nav">
         <router-link
-          v-for="tab in appNavigation"
+          v-for="tab in visibleNavigation"
           :key="tab.id"
           :to="'/' + tab.id"
           class="tab-button"
@@ -63,6 +63,7 @@ import appPackage from '../package.json'
 import { appNavigation } from '@/config/navigation'
 import { useAppStore } from '@/stores/legacy'
 import {
+  clearStoredCurrentUser,
   clearStoredLoginFlag,
   clearStoredLoginNotice,
   clearStoredLoginRedirect,
@@ -72,14 +73,16 @@ import {
 const store = useAppStore()
 const router = useRouter()
 const route = useRoute()
-const { errorMessage } = storeToRefs(store)
+const { errorMessage, isAdmin } = storeToRefs(store)
 const appVersion = appPackage.version
 
 const isLoginPage = computed(() => route.path === '/login')
+const visibleNavigation = computed(() => appNavigation.filter((item) => !item.adminOnly || isAdmin.value))
 
 function handleLogout() {
   clearStoredToken()
   clearStoredLoginFlag()
+  clearStoredCurrentUser()
   clearStoredLoginNotice()
   clearStoredLoginRedirect()
   store.resetState()

@@ -1,6 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { appNavigation } from '@/config/navigation'
-import { getStoredLoginFlag, getStoredToken } from '@/services/api'
+import { getStoredCurrentUser, getStoredLoginFlag, getStoredToken } from '@/services/api'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -38,6 +38,11 @@ const router = createRouter({
       path: '/settings',
       name: 'settings',
       component: () => import('@/views/SettingsView.vue')
+    },
+    {
+      path: '/admin',
+      name: 'admin',
+      component: () => import('@/views/AdminView.vue')
     }
   ]
 })
@@ -54,6 +59,10 @@ router.beforeEach((to) => {
 
   if (!isAuthenticated) {
     return '/login'
+  }
+
+  if (to.path === '/admin' && getStoredCurrentUser()?.role !== 'admin') {
+    return appNavigation[0].path
   }
 
   return true

@@ -2,6 +2,7 @@ export interface AppNavItem {
   id: string
   name: string
   path: string
+  adminOnly?: boolean
 }
 
 export const appNavigation: AppNavItem[] = [
@@ -10,4 +11,5 @@ export const appNavigation: AppNavItem[] = [
   { id: 'chat', name: 'AI聊天', path: '/chat' },
   { id: 'schedule', name: '定时设置', path: '/schedule' },
   { id: 'settings', name: '功能设置', path: '/settings' },
+  { id: 'admin', name: '管理后台', path: '/admin', adminOnly: true },
 ]

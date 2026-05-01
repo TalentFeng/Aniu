@@ -1,8 +1,10 @@
-import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
+import type { AccountOverview, AdminUser, AdminUserCreateRequest, AdminUserStatusUpdateRequest, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, CreditAdjustRequest, LoginRequest, LoginResponse, ModelPricing, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem, UserSession } from '../types.ts'
 import {
+  CURRENT_USER_STORAGE_KEY,
   LOGIN_NOTICE_STORAGE_KEY,
   LOGIN_REDIRECT_STORAGE_KEY,
   LOGIN_STORAGE_KEY,
+  REMEMBERED_USERNAME_STORAGE_KEY,
   TOKEN_STORAGE_KEY,
 } from '../constants.ts'
 
@@ -43,6 +45,40 @@ export function setStoredToken(token: string): void {
 
 export function clearStoredToken(): void {
   removeStorageItem(TOKEN_STORAGE_KEY)
+}
+
+export function getStoredCurrentUser(): UserSession | null {
+  const raw = readStorageItem(CURRENT_USER_STORAGE_KEY)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as UserSession
+  } catch {
+    return null
+  }
+}
+
+export function setStoredCurrentUser(user: UserSession | null): void {
+  if (user === null) {
+    removeStorageItem(CURRENT_USER_STORAGE_KEY)
+    return
+  }
+  writeStorageItem(CURRENT_USER_STORAGE_KEY, JSON.stringify(user))
+}
+
+export function clearStoredCurrentUser(): void {
+  removeStorageItem(CURRENT_USER_STORAGE_KEY)
+}
+
+export function getRememberedUsername(): string {
+  return readStorageItem(REMEMBERED_USERNAME_STORAGE_KEY) ?? ''
+}
+
+export function setRememberedUsername(value: string): void {
+  writeStorageItem(REMEMBERED_USERNAME_STORAGE_KEY, value)
+}
+
+export function clearRememberedUsername(): void {
+  removeStorageItem(REMEMBERED_USERNAME_STORAGE_KEY)
 }
 
 export function getStoredLoginFlag(): boolean {
@@ -96,6 +132,7 @@ function currentLocationPath(): string {
 function handleUnauthorized(message = '登录已过期，请重新登录。'): never {
   clearStoredToken()
   clearStoredLoginFlag()
+  clearStoredCurrentUser()
   setStoredLoginNotice(message)
   if (window.location.pathname !== '/login') {
     setStoredLoginRedirect(currentLocationPath())
@@ -214,6 +251,9 @@ export const api = {
       skipAuthRedirect: true,
     })
   },
+  me() {
+    return request<UserSession>(`${API_PREFIX}/me`)
+  },
   getSettings() {
     return request<AppSettings>(`${API_PREFIX}/settings`)
   },
@@ -273,6 +313,36 @@ export const api = {
   deleteSkill(skillId: string) {
     return request<void>(`${API_PREFIX}/skills/${encodeURIComponent(skillId)}`, {
       method: 'DELETE',
+    })
+  },
+  listUsers() {
+    return request<AdminUser[]>(`${API_PREFIX}/admin/users`)
+  },
+  createUser(payload: AdminUserCreateRequest) {
+    return request<AdminUser>(`${API_PREFIX}/admin/users`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updateUserStatus(userId: number, payload: AdminUserStatusUpdateRequest) {
+    return request<AdminUser>(`${API_PREFIX}/admin/users/${userId}/status`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  adjustUserCredit(userId: number, payload: CreditAdjustRequest) {
+    return request<AdminUser>(`${API_PREFIX}/admin/users/${userId}/credit`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  listModelPricing() {
+    return request<ModelPricing[]>(`${API_PREFIX}/admin/pricing`)
+  },
+  replaceModelPricing(payload: Array<Pick<ModelPricing, 'model_name' | 'credit_cost' | 'is_active'>>) {
+    return request<ModelPricing[]>(`${API_PREFIX}/admin/pricing`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
     })
   },
   getSchedule() {

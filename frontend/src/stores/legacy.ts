@@ -1,8 +1,8 @@
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 
-import { api } from '@/services/api'
-import type { AccountOverview, AppSettings, RoundtableModelConfig, RunDetail, RuntimeOverview, ScheduleConfig } from '@/types'
+import { api, getStoredCurrentUser, setStoredCurrentUser } from '@/services/api'
+import type { AccountOverview, AppSettings, RoundtableModelConfig, RunDetail, RuntimeOverview, ScheduleConfig, UserSession } from '@/types'
 
 const ACCOUNT_REFRESH_COOLDOWN_MS = 60 * 60 * 1000
 const ACCOUNT_REFRESH_STORAGE_KEY = 'aniu-account-last-refresh-at'
@@ -176,6 +176,7 @@ export const useAppStore = defineStore('app', () => {
   const account = ref<AccountOverview>(defaultAccount())
   const runtimeOverview = ref<RuntimeOverview>(defaultRuntimeOverview())
   const runDetailsMap = ref<Record<number, RunDetail>>({})
+  const currentUser = ref<UserSession | null>(getStoredCurrentUser())
   const accountLastManualRefreshAt = ref(readLastAccountRefreshAt())
   const accountRefreshTick = ref(Date.now())
 
@@ -185,6 +186,7 @@ export const useAppStore = defineStore('app', () => {
   const errorMessage = ref('')
 
   const enabledTaskCount = computed(() => schedules.value.filter((task) => task.enabled).length)
+  const isAdmin = computed(() => currentUser.value?.role === 'admin')
   const accountPositionCount = computed(() => account.value.positions.length)
   const activeScheduleCards = computed<ScheduleOverviewItem[]>(() => {
     const items = schedules.value
@@ -270,6 +272,12 @@ export const useAppStore = defineStore('app', () => {
     applySettings(await api.getSettings())
   }
 
+  async function loadCurrentUser() {
+    const payload = await api.me()
+    currentUser.value = payload
+    setStoredCurrentUser(payload)
+  }
+
   async function loadSchedule() {
     applySchedules(await api.getSchedule())
   }
@@ -336,6 +344,7 @@ export const useAppStore = defineStore('app', () => {
     try {
       const results = await Promise.allSettled([
         loadSettings(),
+        loadCurrentUser(),
         loadSchedule(),
         refreshAccountData(),
         refreshRuntimeOverview(),
@@ -360,6 +369,8 @@ export const useAppStore = defineStore('app', () => {
     account.value = defaultAccount()
     runtimeOverview.value = defaultRuntimeOverview()
     runDetailsMap.value = {}
+    currentUser.value = null
+    setStoredCurrentUser(null)
     accountLastManualRefreshAt.value = readLastAccountRefreshAt()
     accountRefreshTick.value = Date.now()
     busy.value = false
@@ -446,10 +457,12 @@ export const useAppStore = defineStore('app', () => {
     settings,
     schedules,
     account,
+    currentUser,
     busy,
     notice,
     errorMessage,
     enabledTaskCount,
+    isAdmin,
     accountPositionCount,
     activeScheduleCards,
     nextScheduledTask,
@@ -460,6 +473,7 @@ export const useAppStore = defineStore('app', () => {
     applySettings,
     applySchedules,
     loadSettings,
+    loadCurrentUser,
     loadSchedule,
     loadRunDetail,
     refreshAfterRunCompletion,

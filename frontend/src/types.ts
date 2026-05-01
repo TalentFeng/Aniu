@@ -28,6 +28,43 @@ export interface AppSettings {
   updated_at: string
 }
 
+export interface UserSession {
+  id: number
+  username: string
+  role: 'admin' | 'user'
+  credit_balance: number
+  is_active: boolean
+}
+
+export interface AdminUser extends UserSession {
+  created_at: string
+  updated_at: string
+}
+
+export interface AdminUserCreateRequest {
+  username: string
+  password: string
+  role: 'admin' | 'user'
+  credit_balance: number
+}
+
+export interface AdminUserStatusUpdateRequest {
+  is_active: boolean
+}
+
+export interface CreditAdjustRequest {
+  amount: number
+  note: string | null
+}
+
+export interface ModelPricing {
+  id: number
+  model_name: string
+  credit_cost: number
+  is_active: boolean
+  created_at: string
+}
+
 export interface ScheduleConfig {
   id: number
   name: string
@@ -315,12 +352,14 @@ export interface ChatStreamRequest {
 }
 
 export interface LoginRequest {
+  username?: string | null
   password: string
 }
 
 export interface LoginResponse {
   authenticated: boolean
   token: string | null
+  user: UserSession | null
 }
 
 export type SkillCompatibilityLevel = 'native' | 'prompt_only' | 'needs_attention'
