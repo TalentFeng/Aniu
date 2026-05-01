@@ -35,6 +35,8 @@ RUN python -m pip install --upgrade pip \
 
 COPY backend/app ./app
 COPY backend/skills ./skills
+COPY backend/alembic.ini ./alembic.ini
+COPY backend/alembic ./alembic
 COPY backend/.env.example ./.env.example
 COPY --from=frontend-build /build/frontend/dist ./static
 
