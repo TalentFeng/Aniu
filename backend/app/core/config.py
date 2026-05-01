@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import secrets
 import shutil
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SKILL_WORKSPACE_DIRNAME = "skill_workspace"
 _JWT_SECRET_FILENAME = "jwt_secret.txt"
+_DEFAULT_DATABASE_URL = "postgresql+psycopg://aniu:aniu@localhost:5432/aniu"
 
 
 class Settings(BaseSettings):
@@ -23,9 +26,9 @@ class Settings(BaseSettings):
 
     app_name: str = "Aniu"
     api_prefix: str = "/api/aniu"
-    sqlite_db_path: Path = Field(
-        default=Path("./data/aniu.sqlite3"), alias="SQLITE_DB_PATH"
-    )
+    database_url: str | None = Field(default=None, alias="DATABASE_URL")
+    sqlite_db_path: Path | None = Field(default=None, alias="SQLITE_DB_PATH")
+    runtime_data_dir: Path = Field(default=Path("./data"), alias="RUNTIME_DATA_DIR")
 
     mx_apikey: str | None = Field(default=None, alias="MX_APIKEY")
     mx_api_url: str = Field(
@@ -41,7 +44,13 @@ class Settings(BaseSettings):
     )
 
     scheduler_poll_seconds: int = Field(default=15, alias="SCHEDULER_POLL_SECONDS")
+    admin_username: str = Field(default="admin", alias="ADMIN_USERNAME")
+    admin_password: str | None = Field(default=None, alias="ADMIN_PASSWORD")
     app_login_password: str | None = Field(default=None, alias="APP_LOGIN_PASSWORD")
+    model_pricing: dict[str, int] = Field(
+        default_factory=lambda: {"gpt-4o-mini": 1, "gpt-4o": 5},
+        alias="MODEL_PRICING",
+    )
     jwt_secret: str | None = Field(default=None, alias="JWT_SECRET")
     jwt_expire_hours: int = Field(default=24, alias="JWT_EXPIRE_HOURS")
     trust_x_forwarded_for: bool = Field(
@@ -53,9 +62,11 @@ class Settings(BaseSettings):
     )
 
     @field_validator(
+        "database_url",
         "mx_apikey",
         "openai_base_url",
         "openai_api_key",
+        "admin_password",
         "app_login_password",
         mode="before",
     )
@@ -73,6 +84,40 @@ class Settings(BaseSettings):
             return None
         return str(value).strip()
 
+    @field_validator("model_pricing", mode="before")
+    @classmethod
+    def parse_model_pricing(cls, value: object) -> dict[str, int]:
+        if isinstance(value, dict):
+            return {
+                str(key).strip(): int(amount)
+                for key, amount in value.items()
+                if str(key).strip()
+            }
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {"gpt-4o-mini": 1, "gpt-4o": 5}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                items: dict[str, int] = {}
+                for chunk in raw.split(","):
+                    if "=" not in chunk:
+                        continue
+                    name, amount = chunk.split("=", 1)
+                    model_name = name.strip()
+                    if not model_name:
+                        continue
+                    items[model_name] = int(amount.strip())
+                return items or {"gpt-4o-mini": 1, "gpt-4o": 5}
+            if isinstance(parsed, dict):
+                return {
+                    str(key).strip(): int(amount)
+                    for key, amount in parsed.items()
+                    if str(key).strip()
+                }
+        return {"gpt-4o-mini": 1, "gpt-4o": 5}
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def parse_origins(cls, value: object) -> list[str]:
@@ -86,18 +131,26 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
-    if not settings.sqlite_db_path.is_absolute():
-        settings.sqlite_db_path = Path.cwd() / settings.sqlite_db_path
-    settings.sqlite_db_path = settings.sqlite_db_path.resolve()
+    cwd = Path.cwd().resolve()
+    if not settings.runtime_data_dir.is_absolute():
+        if cwd.name == "backend" and settings.runtime_data_dir == Path("./data"):
+            settings.runtime_data_dir = (cwd.parent / "data").resolve()
+        else:
+            settings.runtime_data_dir = (cwd / settings.runtime_data_dir).resolve()
+    else:
+        settings.runtime_data_dir = settings.runtime_data_dir.resolve()
+    settings.runtime_data_dir.mkdir(parents=True, exist_ok=True)
 
-    configured_db_path = settings.sqlite_db_path
-    default_db_path = Path.cwd() / "data" / "aniu.sqlite3"
-    legacy_db_path = Path.cwd() / "data" / "aniu.db"
-    using_default_relative_path = configured_db_path == default_db_path
-    # Backward-compatible fallback for older deployments that persisted the
-    # SQLite file as ./data/aniu.db before the default name was unified.
-    if using_default_relative_path and not configured_db_path.exists() and legacy_db_path.exists():
-        settings.sqlite_db_path = legacy_db_path.resolve()
+    if settings.sqlite_db_path is not None and not settings.sqlite_db_path.is_absolute():
+        settings.sqlite_db_path = (Path.cwd() / settings.sqlite_db_path).resolve()
+    elif settings.sqlite_db_path is not None:
+        settings.sqlite_db_path = settings.sqlite_db_path.resolve()
+
+    if not settings.database_url:
+        if settings.sqlite_db_path is not None:
+            settings.database_url = f"sqlite+pysqlite:///{settings.sqlite_db_path.as_posix()}"
+        else:
+            settings.database_url = _DEFAULT_DATABASE_URL
 
     _merge_legacy_skill_workspace(settings)
     if not settings.jwt_secret:
@@ -108,34 +161,63 @@ def get_settings() -> Settings:
 
 
 def get_runtime_data_dir(settings: Settings | None = None) -> Path:
+    return (settings or get_settings()).runtime_data_dir.resolve()
+
+
+def get_skill_workspace_root(
+    settings: Settings | None = None,
+    user_id: int | None = None,
+) -> Path:
     current = settings or get_settings()
-    cwd = Path.cwd().resolve()
-    if cwd.name == "backend" and cwd in current.sqlite_db_path.parents:
-        return (cwd.parent / "data").resolve()
-    return current.sqlite_db_path.parent.resolve()
+    if user_id is None and current.sqlite_db_path is not None:
+        root = current.sqlite_db_path.parent / _SKILL_WORKSPACE_DIRNAME
+    else:
+        root = get_runtime_data_dir(current) / _SKILL_WORKSPACE_DIRNAME
+    if user_id is not None:
+        root = root / str(user_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
 
 
-def get_skill_workspace_root(settings: Settings | None = None) -> Path:
-    return get_runtime_data_dir(settings) / _SKILL_WORKSPACE_DIRNAME
+def get_skill_workspace_skills_dir(
+    settings: Settings | None = None,
+    user_id: int | None = None,
+) -> Path:
+    path = get_skill_workspace_root(settings, user_id=user_id) / "skills"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
 
 
-def get_skill_workspace_skills_dir(settings: Settings | None = None) -> Path:
-    return get_skill_workspace_root(settings) / "skills"
+def get_uploads_root(
+    settings: Settings | None = None,
+    user_id: int | None = None,
+) -> Path:
+    path = get_runtime_data_dir(settings) / "uploads"
+    if user_id is not None:
+        path = path / str(user_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
 
 
 def get_persistent_jwt_secret_file(settings: Settings | None = None) -> Path:
     return get_runtime_data_dir(settings) / _JWT_SECRET_FILENAME
 
 
-def _legacy_skill_workspace_root(settings: Settings) -> Path:
-    return settings.sqlite_db_path.parent / _SKILL_WORKSPACE_DIRNAME
+def _legacy_skill_workspace_root(settings: Settings) -> Path | None:
+    if settings.sqlite_db_path is not None:
+        return settings.sqlite_db_path.parent / _SKILL_WORKSPACE_DIRNAME
+
+    cwd = Path.cwd().resolve()
+    if cwd.name == "backend":
+        return cwd / "data" / _SKILL_WORKSPACE_DIRNAME
+    return None
 
 
 def _merge_legacy_skill_workspace(settings: Settings) -> None:
     legacy_root = _legacy_skill_workspace_root(settings)
-    target_root = get_skill_workspace_root(settings)
-    if not legacy_root.exists():
+    if legacy_root is None or not legacy_root.exists():
         return
+    target_root = get_skill_workspace_root(settings)
     if legacy_root.resolve() == target_root.resolve():
         return
 
@@ -148,6 +230,12 @@ def _merge_legacy_skill_workspace(settings: Settings) -> None:
             shutil.copytree(child, destination)
         else:
             shutil.copy2(child, destination)
+
+
+def is_sqlite_database(settings: Settings | None = None) -> bool:
+    current = settings or get_settings()
+    parsed = urlparse(str(current.database_url or ""))
+    return parsed.scheme.startswith("sqlite")
 
 
 def _load_or_create_jwt_secret(secret_file: Path) -> str:

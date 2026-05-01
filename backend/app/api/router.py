@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.core.auth import get_current_user
+from app.core.auth import get_current_user, require_admin
 from app.db.database import get_db
+from app.db.models import User
 from app.schemas.aniu import (
+    AdminUserCreateRequest,
+    AdminUserStatusUpdateRequest,
     AccountOverviewDebugRead,
     AccountOverviewRead,
     AppSettingsRead,
     AppSettingsUpdate,
     ChatAttachmentRead,
+    CreditAdjustRequest,
     ChatMessageRead,
     ChatRequest,
     ChatResponse,
@@ -27,6 +32,8 @@ from app.schemas.aniu import (
     ChatStreamRequest,
     LoginRequest,
     LoginResponse,
+    ModelPricingBase,
+    ModelPricingRead,
     RunDetailRead,
     RawToolPreviewDetailRead,
     RunSummaryRead,
@@ -38,7 +45,10 @@ from app.schemas.aniu import (
     SkillImportSkillHubRequest,
     SkillInfoRead,
     SkillListItemRead,
+    UserRead,
+    UserSessionRead,
 )
+from app.services.admin_service import admin_service
 from app.services.aniu_service import aniu_service
 from app.services.chat_session_service import (
     MAX_ATTACHMENTS_PER_MESSAGE,
@@ -55,46 +65,132 @@ router = APIRouter(prefix="/api/aniu", tags=["aniu"])
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest) -> LoginResponse:
+def login(
+    payload: LoginRequest,
+    db: Session = Depends(get_db),
+) -> LoginResponse:
     try:
-        return aniu_service.authenticate_login(payload.password)
+        return aniu_service.authenticate_login(
+            db,
+            username=payload.username,
+            password=payload.password,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@router.get("/me", response_model=UserSessionRead)
+def get_me(user: User = Depends(get_current_user)) -> UserSessionRead:
+    return user
 
 
 @router.get("/settings", response_model=AppSettingsRead)
 def get_settings(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> AppSettingsRead:
-    return aniu_service.get_or_create_settings(db)
+    return aniu_service.get_or_create_settings(db, user)
 
 
 @router.put("/settings", response_model=AppSettingsRead)
 def update_settings(
     payload: AppSettingsUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> AppSettingsRead:
-    return aniu_service.update_settings(db, payload)
+    return aniu_service.update_settings(db, user, payload)
+
+
+@router.get("/admin/users", response_model=list[UserRead])
+def list_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[UserRead]:
+    _ = admin
+    return admin_service.list_users(db)
+
+
+@router.post("/admin/users", response_model=UserRead)
+def create_user(
+    payload: AdminUserCreateRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> UserRead:
+    _ = admin
+    try:
+        return admin_service.create_user(db, payload)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/admin/users/{user_id}/status", response_model=UserRead)
+def update_user_status(
+    user_id: int,
+    payload: AdminUserStatusUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> UserRead:
+    _ = admin
+    try:
+        return admin_service.set_user_active(db, user_id, payload.is_active)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/admin/users/{user_id}/credit", response_model=UserRead)
+def adjust_user_credit(
+    user_id: int,
+    payload: CreditAdjustRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> UserRead:
+    _ = admin
+    try:
+        return admin_service.adjust_credit(
+            db,
+            user_id=user_id,
+            amount=payload.amount,
+            note=payload.note,
+            tx_type="recharge" if payload.amount >= 0 else "admin_adjust",
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/admin/pricing", response_model=list[ModelPricingRead])
+def list_model_pricing(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[ModelPricingRead]:
+    _ = admin
+    return admin_service.list_model_pricing(db)
+
+
+@router.put("/admin/pricing", response_model=list[ModelPricingRead])
+def replace_model_pricing(
+    payload: list[ModelPricingBase],
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[ModelPricingRead]:
+    _ = admin
+    return admin_service.replace_model_pricing(db, payload)
 
 
 @router.get("/skills", response_model=list[SkillListItemRead])
 def list_skills(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[SkillListItemRead]:
-    return skill_admin_service.list_skills(db)
+    return skill_admin_service.list_skills(db, user)
 
 
 @router.post("/skills/import-clawhub", response_model=SkillInfoRead)
 def import_clawhub_skill(
     payload: SkillImportClawHubRequest,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SkillInfoRead:
     try:
-        return skill_admin_service.import_from_clawhub(db, payload.slug_or_url)
+        return skill_admin_service.import_from_clawhub(db, payload.slug_or_url, user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileExistsError as exc:
@@ -107,10 +203,10 @@ def import_clawhub_skill(
 def import_skillhub_skill(
     payload: SkillImportSkillHubRequest,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SkillInfoRead:
     try:
-        return skill_admin_service.import_from_skillhub(db, payload.slug_or_url)
+        return skill_admin_service.import_from_skillhub(db, payload.slug_or_url, user)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileExistsError as exc:
@@ -123,7 +219,7 @@ def import_skillhub_skill(
 def import_zip_skill(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SkillInfoRead:
     archive_bytes = file.file.read(MAX_SKILL_ARCHIVE_BYTES + 1)
     if len(archive_bytes) > MAX_SKILL_ARCHIVE_BYTES:
@@ -137,6 +233,7 @@ def import_zip_skill(
     try:
         return skill_admin_service.import_from_zip(
             db,
+            user=user,
             filename=file.filename or "skill.zip",
             archive_bytes=archive_bytes,
         )
@@ -149,19 +246,24 @@ def import_zip_skill(
 @router.post("/skills/reload", response_model=list[SkillListItemRead])
 def reload_skills(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[SkillListItemRead]:
-    return skill_admin_service.reload(db)
+    return skill_admin_service.reload(db, user)
 
 
 @router.post("/skills/{skill_id}/enable", response_model=SkillInfoRead)
 def enable_skill(
     skill_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SkillInfoRead:
     try:
-        return skill_admin_service.set_enabled(db, skill_id=skill_id, enabled=True)
+        return skill_admin_service.set_enabled(
+            db,
+            user=user,
+            skill_id=skill_id,
+            enabled=True,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -172,10 +274,15 @@ def enable_skill(
 def disable_skill(
     skill_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SkillInfoRead:
     try:
-        return skill_admin_service.set_enabled(db, skill_id=skill_id, enabled=False)
+        return skill_admin_service.set_enabled(
+            db,
+            user=user,
+            skill_id=skill_id,
+            enabled=False,
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -186,10 +293,10 @@ def disable_skill(
 def delete_skill(
     skill_id: str,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> None:
     try:
-        skill_admin_service.delete_skill(db, skill_id=skill_id)
+        skill_admin_service.delete_skill(db, user=user, skill_id=skill_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -199,18 +306,18 @@ def delete_skill(
 @router.get("/schedule", response_model=list[ScheduleRead])
 def get_schedule(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[ScheduleRead]:
-    return aniu_service.list_schedules(db)
+    return aniu_service.list_schedules(db, user)
 
 
 @router.put("/schedule", response_model=list[ScheduleRead])
 def update_schedule(
     payload: list[ScheduleUpdate],
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[ScheduleRead]:
-    return aniu_service.replace_schedules(db, payload)
+    return aniu_service.replace_schedules(db, user, payload)
 
 
 @router.post("/run", response_model=RunDetailRead)
@@ -218,10 +325,11 @@ def run_once(
     schedule_id: int | None = Query(default=None, ge=1),
     run_type: Literal["analysis", "trade"] | None = Query(default=None),
     analysis_mode: Literal["single", "roundtable"] | None = Query(default=None),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> RunDetailRead:
     try:
         return aniu_service.execute_run(
+            user,
             trigger_source="manual",
             schedule_id=schedule_id,
             manual_run_type=run_type,
@@ -238,7 +346,7 @@ def run_stream(
     schedule_id: int | None = Query(default=None, ge=1),
     run_type: Literal["analysis", "trade"] | None = Query(default=None),
     analysis_mode: Literal["single", "roundtable"] | None = Query(default=None),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Launch a run in the background and return run_id immediately.
 
@@ -246,6 +354,7 @@ def run_stream(
     """
     try:
         run_id = aniu_service.start_run_async(
+            user=user,
             trigger_source="manual",
             schedule_id=schedule_id,
             manual_run_type=run_type,
@@ -261,8 +370,11 @@ def run_stream(
 @router.get("/runs/{run_id}/events")
 def run_events(
     run_id: int,
-    _user: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
+    run = aniu_service.get_run(db, user, run_id)
+
     def _generator():
         try:
             for event in event_bus.stream(run_id):
@@ -278,6 +390,42 @@ def run_events(
         "X-Accel-Buffering": "no",
         "Connection": "keep-alive",
     }
+    if run is None:
+        try:
+            stream = event_bus.stream(run_id)
+            first_event = next(stream)
+        except RuntimeError as exc:
+            err = json.dumps({"type": "failed", "message": str(exc)}, ensure_ascii=False)
+            return StreamingResponse(
+                iter([f"event: failed\ndata: {err}\n\n"]),
+                media_type="text/event-stream",
+                headers=headers,
+            )
+        except StopIteration:
+            raise HTTPException(status_code=404, detail="运行记录不存在。") from None
+
+        def _missing_run_generator():
+            event_type = str(first_event.get("type") or "message")
+            data = json.dumps(first_event, ensure_ascii=False)
+            yield f"event: {event_type}\ndata: {data}\n\n"
+            try:
+                for event in stream:
+                    event_type = str(event.get("type") or "message")
+                    data = json.dumps(event, ensure_ascii=False)
+                    yield f"event: {event_type}\ndata: {data}\n\n"
+            except Exception as exc:  # noqa: BLE001
+                err = json.dumps(
+                    {"type": "failed", "message": str(exc)},
+                    ensure_ascii=False,
+                )
+                yield f"event: failed\ndata: {err}\n\n"
+
+        return StreamingResponse(
+            _missing_run_generator(),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+
     return StreamingResponse(
         _generator(),
         media_type="text/event-stream",
@@ -292,10 +440,11 @@ def list_runs(
     status: str | None = Query(default=None),
     before_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[RunSummaryRead]:
     return aniu_service.list_runs(
         db,
+        user,
         limit=limit,
         run_date=run_date,
         status=status,
@@ -310,10 +459,11 @@ def list_runs_feed(
     status: str | None = Query(default=None),
     before_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> RunSummaryPageRead:
     return aniu_service.list_runs_page(
         db,
+        user,
         limit=limit,
         run_date=run_date,
         status=status,
@@ -325,9 +475,9 @@ def list_runs_feed(
 def get_run(
     run_id: int,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> RunDetailRead:
-    run = aniu_service.get_run(db, run_id)
+    run = aniu_service.get_run(db, user, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="运行记录不存在。")
     return run
@@ -341,10 +491,10 @@ def get_run_raw_tool_preview(
     run_id: int,
     preview_index: int = Path(ge=0),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> RawToolPreviewDetailRead:
     try:
-        return aniu_service.get_run_raw_tool_preview(db, run_id, preview_index)
+        return aniu_service.get_run_raw_tool_preview(db, user, run_id, preview_index)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -354,10 +504,10 @@ def delete_run(
     run_id: int,
     force: bool = Query(default=False),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> None:
     try:
-        aniu_service.delete_run(db, run_id, force=force)
+        aniu_service.delete_run(db, user, run_id, force=force)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -367,18 +517,23 @@ def delete_run(
 @router.get("/runtime-overview", response_model=RuntimeOverviewRead)
 def get_runtime_overview(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> RuntimeOverviewRead:
-    return aniu_service.get_runtime_overview(db)
+    return aniu_service.get_runtime_overview(db, user)
 
 
 @router.get("/account", response_model=AccountOverviewRead)
 def get_account(
     force_refresh: bool = Query(default=False),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> AccountOverviewRead:
     try:
-        return aniu_service.get_account_overview(force_refresh=force_refresh)
+        try:
+            return aniu_service.get_account_overview(user, force_refresh=force_refresh)
+        except TypeError as exc:
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                raise
+            return aniu_service.get_account_overview(force_refresh=force_refresh)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -386,13 +541,22 @@ def get_account(
 @router.get("/account/debug", response_model=AccountOverviewDebugRead)
 def get_account_debug(
     force_refresh: bool = Query(default=False),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> AccountOverviewDebugRead:
     try:
-        return aniu_service.get_account_overview(
-            include_raw=True,
-            force_refresh=force_refresh,
-        )
+        try:
+            return aniu_service.get_account_overview(
+                user,
+                include_raw=True,
+                force_refresh=force_refresh,
+            )
+        except TypeError as exc:
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                raise
+            return aniu_service.get_account_overview(
+                include_raw=True,
+                force_refresh=force_refresh,
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -400,11 +564,18 @@ def get_account_debug(
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest,
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> ChatResponse:
     try:
-        return aniu_service.chat(payload)
+        try:
+            return aniu_service.chat(payload, user=user)
+        except TypeError as exc:
+            if "unexpected keyword argument 'user'" not in str(exc):
+                raise
+            return aniu_service.chat(payload)
     except RuntimeError as exc:
+        if "credit 余额不足" in str(exc):
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -413,11 +584,13 @@ def chat(
 @router.post("/chat-stream")
 def chat_stream(
     payload: ChatRequest,
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     try:
-        event_iter = aniu_service.chat_stream(payload)
+        event_iter = aniu_service.chat_stream(payload, user=user)
     except RuntimeError as exc:
+        if "credit 余额不足" in str(exc):
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def _generator():
@@ -445,19 +618,19 @@ def chat_stream(
 @router.get("/chat/sessions", response_model=list[ChatSessionRead])
 def list_chat_sessions(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> list[ChatSessionRead]:
-    return chat_session_service.list_sessions(db)
+    return chat_session_service.list_sessions(db, user)
 
 
 @router.post("/chat/sessions", response_model=ChatSessionRead)
 def create_chat_session(
     payload: ChatSessionCreate | None = None,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> ChatSessionRead:
     title = payload.title if payload else None
-    result = chat_session_service.create_session(db, title=title)
+    result = chat_session_service.create_session(db, user=user, title=title)
     db.commit()
     return result
 
@@ -467,11 +640,11 @@ def rename_chat_session(
     session_id: int,
     payload: ChatSessionUpdate,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> ChatSessionRead:
     try:
         result = chat_session_service.rename_session(
-            db, session_id, title=payload.title
+            db, session_id, user=user, title=payload.title
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -483,10 +656,10 @@ def rename_chat_session(
 def delete_chat_session(
     session_id: int,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> None:
     try:
-        chat_session_service.delete_session(db, session_id)
+        chat_session_service.delete_session(db, session_id, user)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     db.commit()
@@ -501,12 +674,13 @@ def list_chat_messages(
     limit: int = Query(default=50, ge=1, le=100),
     before_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> ChatSessionMessagesPageRead:
     try:
         session, messages, next_before_id, has_more = chat_session_service.list_messages(
             db,
             session_id,
+            user,
             limit=limit,
             before_id=before_id,
         )
@@ -523,9 +697,9 @@ def list_chat_messages(
 @router.get("/persistent-session", response_model=PersistentSessionRead)
 def get_persistent_session(
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> PersistentSessionRead:
-    return aniu_service.get_persistent_session(db)
+    return aniu_service.get_persistent_session(db, user)
 
 
 @router.get(
@@ -536,10 +710,11 @@ def list_persistent_session_messages(
     limit: int = Query(default=50, ge=1, le=100),
     before_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> PersistentSessionMessagesPageRead:
     session, messages, next_before_id, has_more = aniu_service.list_persistent_session_messages(
         db,
+        user,
         limit=limit,
         before_id=before_id,
     )
@@ -556,7 +731,7 @@ def upload_chat_attachment(
     file: UploadFile = File(...),
     session_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> ChatAttachmentRead:
     data = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
@@ -567,6 +742,7 @@ def upload_chat_attachment(
     try:
         result = chat_session_service.save_attachment(
             db,
+            user=user,
             filename=file.filename or "upload.bin",
             mime_type=file.content_type or "application/octet-stream",
             data=data,
@@ -582,11 +758,11 @@ def upload_chat_attachment(
 def download_chat_attachment(
     attachment_id: int,
     db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> FileResponse:
     try:
         path, mime_type, filename = chat_session_service.get_attachment_file(
-            db, attachment_id
+            db, attachment_id, user
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -596,15 +772,17 @@ def download_chat_attachment(
 @router.post("/chat/stream")
 def chat_session_stream(
     payload: ChatStreamRequest,
-    _user: str = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     try:
-        event_iter = chat_session_service.stream_chat(payload)
+        event_iter = chat_session_service.stream_chat(payload, user)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
+        if "credit 余额不足" in str(exc):
+            raise HTTPException(status_code=402, detail=str(exc)) from exc
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def _generator():

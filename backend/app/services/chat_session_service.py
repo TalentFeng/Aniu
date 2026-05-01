@@ -18,9 +18,9 @@ from xml.etree import ElementTree as ET
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
+from app.core.config import get_settings, get_uploads_root
 from app.db.database import session_scope
-from app.db.models import ChatAttachment, ChatMessageRecord, ChatSession
+from app.db.models import ChatAttachment, ChatMessageRecord, ChatSession, User
 from app.schemas.aniu import (
     ChatAttachmentRead,
     ChatMessageRead,
@@ -99,9 +99,16 @@ def _assume_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def _uploads_root(session_id: int | None = None) -> Path:
-    settings = get_settings()
-    root = settings.sqlite_db_path.parent / "chat_uploads"
+def _uploads_root(user_id: int | None, session_id: int | None = None) -> Path:
+    if user_id is None:
+        settings = get_settings()
+        root = (
+            settings.sqlite_db_path.parent / "chat_uploads"
+            if settings.sqlite_db_path is not None
+            else get_uploads_root().parent / "chat_uploads"
+        )
+    else:
+        root = get_uploads_root(user_id=user_id)
     if session_id is not None:
         root = root / str(session_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -322,6 +329,16 @@ def _extract_attachment_text(path: Path, mime_type: str) -> str:
 
 
 class ChatSessionService:
+    def _resolve_user_id(self, db: Session, user: User | int | None) -> int:
+        if isinstance(user, User):
+            return int(user.id)
+        if isinstance(user, int):
+            return int(user)
+        instance = db.scalar(select(User).order_by(User.id.asc()).limit(1))
+        if instance is None:
+            raise RuntimeError("系统暂无可用用户，请先创建管理员。")
+        return int(instance.id)
+
     def _build_attachment_content_parts(
         self,
         attachments_payload: list[dict[str, Any]] | None,
@@ -442,19 +459,28 @@ class ChatSessionService:
         content_parts.extend(attachment_parts)
         return content_parts
 
-    def list_sessions(self, db: Session) -> list[ChatSessionRead]:
+    def list_sessions(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> list[ChatSessionRead]:
+        user_id = self._resolve_user_id(db, user)
         count_sub = (
             select(
                 ChatMessageRecord.session_id,
                 func.count(ChatMessageRecord.id).label("count"),
             )
+            .where(ChatMessageRecord.user_id == user_id)
             .group_by(ChatMessageRecord.session_id)
             .subquery()
         )
 
         rows = db.execute(
             select(ChatSession, func.coalesce(count_sub.c.count, 0))
-            .where(ChatSession.kind == "user")
+            .where(
+                ChatSession.kind == "user",
+                ChatSession.user_id == user_id,
+            )
             .outerjoin(count_sub, count_sub.c.session_id == ChatSession.id)
             .order_by(
                 ChatSession.last_message_at.desc().nullslast(),
@@ -465,9 +491,15 @@ class ChatSessionService:
         return [_session_to_read(session, int(count)) for session, count in rows]
 
     def create_session(
-        self, db: Session, *, title: str | None = None
+        self,
+        db: Session,
+        *,
+        user: User | int | None = None,
+        title: str | None = None,
     ) -> ChatSessionRead:
+        user_id = self._resolve_user_id(db, user)
         session = ChatSession(
+            user_id=user_id,
             title=(title or DEFAULT_SESSION_TITLE).strip() or DEFAULT_SESSION_TITLE,
             kind="user",
         )
@@ -476,23 +508,44 @@ class ChatSessionService:
         return _session_to_read(session, 0)
 
     def rename_session(
-        self, db: Session, session_id: int, *, title: str
+        self,
+        db: Session,
+        session_id: int,
+        *,
+        user: User | int | None = None,
+        title: str,
     ) -> ChatSessionRead:
+        user_id = self._resolve_user_id(db, user)
         session = db.get(ChatSession, session_id)
-        if session is None or str(session.kind or "user") != "user":
+        if (
+            session is None
+            or int(session.user_id) != user_id
+            or str(session.kind or "user") != "user"
+        ):
             raise LookupError("会话不存在。")
         session.title = title.strip() or session.title
         db.flush()
         count = db.execute(
             select(func.count(ChatMessageRecord.id)).where(
-                ChatMessageRecord.session_id == session_id
+                ChatMessageRecord.session_id == session_id,
+                ChatMessageRecord.user_id == user_id,
             )
         ).scalar_one()
         return _session_to_read(session, int(count))
 
-    def delete_session(self, db: Session, session_id: int) -> None:
+    def delete_session(
+        self,
+        db: Session,
+        session_id: int,
+        user: User | int | None = None,
+    ) -> None:
+        user_id = self._resolve_user_id(db, user)
         session = db.get(ChatSession, session_id)
-        if session is None or str(session.kind or "user") != "user":
+        if (
+            session is None
+            or int(session.user_id) != user_id
+            or str(session.kind or "user") != "user"
+        ):
             raise LookupError("会话不存在。")
         db.delete(session)
 
@@ -500,24 +553,34 @@ class ChatSessionService:
         self,
         db: Session,
         session_id: int,
+        user: User | int | None = None,
         *,
         limit: int = 50,
         before_id: int | None = None,
     ) -> tuple[ChatSessionRead, list[ChatMessageRead], int | None, bool]:
+        user_id = self._resolve_user_id(db, user)
         session = db.get(ChatSession, session_id)
-        if session is None or str(session.kind or "user") != "user":
+        if (
+            session is None
+            or int(session.user_id) != user_id
+            or str(session.kind or "user") != "user"
+        ):
             raise LookupError("会话不存在。")
 
         page_size = max(1, int(limit))
         total_count = db.execute(
             select(func.count(ChatMessageRecord.id)).where(
-                ChatMessageRecord.session_id == session_id
+                ChatMessageRecord.session_id == session_id,
+                ChatMessageRecord.user_id == user_id,
             )
         ).scalar_one()
 
         stmt = (
             select(ChatMessageRecord)
-            .where(ChatMessageRecord.session_id == session_id)
+            .where(
+                ChatMessageRecord.session_id == session_id,
+                ChatMessageRecord.user_id == user_id,
+            )
             .order_by(ChatMessageRecord.id.desc())
         )
         if before_id is not None:
@@ -546,11 +609,19 @@ class ChatSessionService:
         self,
         db: Session,
         *,
+        user: User | int | None = None,
         filename: str,
         mime_type: str,
         data: bytes,
         session_id: int | None = None,
     ) -> ChatAttachmentRead:
+        user_id = self._resolve_user_id(db, user)
+        if isinstance(user, User):
+            storage_user_id = int(user.id)
+        elif isinstance(user, int):
+            storage_user_id = int(user)
+        else:
+            storage_user_id = None
         if len(data) > MAX_UPLOAD_BYTES:
             raise ValueError(
                 f"文件过大，最大允许 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB。"
@@ -561,10 +632,11 @@ class ChatSessionService:
         )
         suffix = Path(safe_filename).suffix
         stored_name = f"{uuid.uuid4().hex}{suffix}"
-        storage_path = _uploads_root(session_id) / stored_name
+        storage_path = _uploads_root(storage_user_id, session_id) / stored_name
         storage_path.write_bytes(data)
 
         attachment = ChatAttachment(
+            user_id=user_id,
             filename=safe_filename,
             mime_type=normalized_mime_type,
             size=len(data),
@@ -575,10 +647,14 @@ class ChatSessionService:
         return _attachment_to_read(attachment)
 
     def get_attachment_file(
-        self, db: Session, attachment_id: int
+        self,
+        db: Session,
+        attachment_id: int,
+        user: User | int | None = None,
     ) -> tuple[Path, str, str]:
+        user_id = self._resolve_user_id(db, user)
         attachment = db.get(ChatAttachment, attachment_id)
-        if attachment is None:
+        if attachment is None or int(attachment.user_id) != user_id:
             raise LookupError("附件不存在。")
         path = Path(attachment.storage_path)
         if not path.is_file():
@@ -586,14 +662,20 @@ class ChatSessionService:
         return path, attachment.mime_type, attachment.filename
 
     def _resolve_attachments(
-        self, db: Session, attachment_ids: list[int]
+        self,
+        db: Session,
+        user_id: int,
+        attachment_ids: list[int],
     ) -> list[ChatAttachment]:
         if not attachment_ids:
             return []
         unique_ids = list(dict.fromkeys(int(x) for x in attachment_ids))
         records = (
             db.execute(
-                select(ChatAttachment).where(ChatAttachment.id.in_(unique_ids))
+                select(ChatAttachment).where(
+                    ChatAttachment.id.in_(unique_ids),
+                    ChatAttachment.user_id == user_id,
+                )
             )
             .scalars()
             .all()
@@ -666,7 +748,11 @@ class ChatSessionService:
             return f"{content}\n\n{notice}"
         return notice
 
-    def stream_chat(self, payload: ChatStreamRequest) -> Iterator[dict[str, Any]]:
+    def stream_chat(
+        self,
+        payload: ChatStreamRequest,
+        user: User | int | None = None,
+    ) -> Iterator[dict[str, Any]]:
         if len(payload.attachment_ids) > MAX_ATTACHMENTS_PER_MESSAGE:
             raise ValueError(
                 f"单条消息最多允许 {MAX_ATTACHMENTS_PER_MESSAGE} 个附件。"
@@ -675,7 +761,18 @@ class ChatSessionService:
         with session_scope() as db:
             from app.services.aniu_service import aniu_service
 
-            settings = aniu_service.get_or_create_settings(db)
+            user_id = self._resolve_user_id(db, user)
+            settings = aniu_service.get_or_create_settings(db, user_id)
+            cost = aniu_service._estimate_credit_cost(db, settings=settings)
+            if user is not None:
+                aniu_service._consume_credit(
+                    db,
+                    user_id=user_id,
+                    amount=cost,
+                    tx_type="consume",
+                    related_run_id=None,
+                    note="chat-session-stream",
+                )
             if (
                 not roundtable_service.is_enabled(settings)
                 and (not settings.llm_base_url or not settings.llm_api_key)
@@ -683,14 +780,19 @@ class ChatSessionService:
                 raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 
             session = db.get(ChatSession, payload.session_id)
-            if session is None or str(session.kind or "user") != "user":
+            if (
+                session is None
+                or int(session.user_id) != user_id
+                or str(session.kind or "user") != "user"
+            ):
                 raise LookupError("会话不存在。")
 
-            attachments = self._resolve_attachments(db, payload.attachment_ids)
+            attachments = self._resolve_attachments(db, user_id, payload.attachment_ids)
             attachment_payload = [_attachment_dict(item) for item in attachments]
             normalized_content = str(payload.content or "").strip()
 
             user_record = ChatMessageRecord(
+                user_id=user_id,
                 session_id=session.id,
                 role="user",
                 content=normalized_content,
@@ -706,7 +808,10 @@ class ChatSessionService:
             history_records = (
                 db.execute(
                     select(ChatMessageRecord)
-                    .where(ChatMessageRecord.session_id == session.id)
+                    .where(
+                        ChatMessageRecord.session_id == session.id,
+                        ChatMessageRecord.user_id == user_id,
+                    )
                     .order_by(ChatMessageRecord.id.asc())
                 )
                 .scalars()
@@ -714,6 +819,7 @@ class ChatSessionService:
             )
             history_messages = self._build_history_messages(history_records)
             settings_snapshot = SimpleNamespace(
+                user_id=user_id,
                 mx_api_key=settings.mx_api_key,
                 system_prompt=settings.system_prompt,
                 llm_model=settings.llm_model,
@@ -871,7 +977,7 @@ class ChatSessionService:
 
             with session_scope() as db:
                 session = db.get(ChatSession, session_id)
-                if session is not None:
+                if session is not None and int(session.user_id) == int(settings_snapshot.user_id):
                     assistant_content = ""
                     if failed_message is not None:
                         assistant_content = self._build_failed_assistant_content(
@@ -887,6 +993,7 @@ class ChatSessionService:
 
                     if assistant_content or captured_tool_calls:
                         assistant_record = ChatMessageRecord(
+                            user_id=int(settings_snapshot.user_id),
                             session_id=session_id,
                             role="assistant",
                             content=assistant_content,

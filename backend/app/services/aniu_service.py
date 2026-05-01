@@ -16,23 +16,27 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import create_access_token
 from app.core.config import get_settings
 from app.core.constants import DEFAULT_SYSTEM_PROMPT
-from app.db.database import session_scope
+from app.db.database import session_scope, verify_password
 from app.db.models import (
     AppSettings,
     ChatMessageRecord,
     ChatSession,
+    CreditTransaction,
     StrategyRun,
     StrategySchedule,
     TradeOrder,
+    User,
 )
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
 from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.skills.providers import build_skill_context
+from app.services.admin_service import admin_service
 from app.services.event_bus import event_bus, make_emitter
 from app.services.llm_service import LLMStreamCancelled, llm_service
 from app.services.roundtable_service import roundtable_service
@@ -234,10 +238,144 @@ def _order_status_text(
 
 class AniuService:
     def __init__(self) -> None:
-        self._run_lock = Lock()
+        self._run_locks: dict[int, Lock] = {}
+        self._run_locks_guard = Lock()
+        self._run_lock = self._get_run_lock(1)
         self._account_cache_lock = Lock()
-        self._account_overview_cache: dict[str, Any] | None = None
-        self._account_overview_cache_expires_at: datetime | None = None
+        self._account_overview_cache: dict[int, dict[str, Any]] | None = None
+        self._account_overview_cache_expires_at: dict[int, datetime] | None = None
+
+    def _normalize_user_id(self, user: User | int) -> int:
+        return user.id if isinstance(user, User) else int(user)
+
+    def _resolve_user_id(self, db: Session, user: User | int | None) -> int:
+        if user is not None:
+            return self._normalize_user_id(user)
+        try:
+            candidate = db.scalar(select(User).order_by(User.id.asc()).limit(1))
+        except OperationalError:
+            return 1
+        if candidate is None:
+            return 1
+        return int(candidate.id)
+
+    def _get_run_lock(self, user_id: int) -> Lock:
+        with self._run_locks_guard:
+            lock = self._run_locks.get(user_id)
+            if lock is None:
+                lock = Lock()
+                self._run_locks[user_id] = lock
+            return lock
+
+    def _require_owned_schedule(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        schedule_id: int,
+    ) -> StrategySchedule | None:
+        schedule = db.get(StrategySchedule, schedule_id)
+        if schedule is None:
+            return None
+        if int(schedule.user_id) != int(user_id):
+            raise LookupError("定时任务不存在。")
+        return schedule
+
+    def _require_owned_run(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        run_id: int,
+    ) -> StrategyRun | None:
+        run = db.get(StrategyRun, run_id)
+        if run is None:
+            return None
+        if int(run.user_id) != int(user_id):
+            raise LookupError("运行记录不存在。")
+        return run
+
+    def _require_owned_session(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        session_id: int,
+    ) -> ChatSession | None:
+        session = db.get(ChatSession, session_id)
+        if session is None:
+            return None
+        if int(session.user_id) != int(user_id):
+            raise LookupError("会话不存在。")
+        return session
+
+    def _estimate_credit_cost(self, db: Session, *, settings: Any) -> int:
+        if not isinstance(settings, AppSettings):
+            return 0
+        models: list[str] = []
+        roundtable_enabled = bool(getattr(settings, "roundtable_enabled", False))
+        if roundtable_enabled:
+            moderator = getattr(settings, "roundtable_moderator", None)
+            if isinstance(moderator, dict) and moderator.get("enabled", True):
+                models.append(str(moderator.get("llm_model") or ""))
+            participants = getattr(settings, "roundtable_participants", None) or []
+            for item in participants:
+                if not isinstance(item, dict) or not item.get("enabled", True):
+                    continue
+                models.append(str(item.get("llm_model") or ""))
+        else:
+            models.append(str(getattr(settings, "llm_model", "") or ""))
+
+        total = 0
+        for model_name in models:
+            total += admin_service.get_model_price(db, model_name)
+        return total
+
+    def _consume_credit(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        amount: int,
+        tx_type: str,
+        related_run_id: int | None,
+        note: str,
+    ) -> None:
+        if amount <= 0:
+            return
+        user = db.get(User, user_id)
+        if user is None:
+            raise RuntimeError("用户不存在。")
+        current_balance = int(user.credit_balance or 0)
+        if current_balance < amount:
+            raise RuntimeError("credit 余额不足。")
+        user.credit_balance = current_balance - amount
+        db.add(user)
+        db.flush()
+        db.add(
+            CreditTransaction(
+                user_id=user_id,
+                amount=-amount,
+                balance_after=user.credit_balance,
+                type=tx_type,
+                related_run_id=related_run_id,
+                note=note,
+            )
+        )
+
+    def _get_settings_for_user(self, db: Session, user_id: int) -> Any:
+        try:
+            return self.get_or_create_settings(db, user_id)
+        except TypeError as exc:
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                raise
+            settings = self.get_or_create_settings(db)
+            if not hasattr(settings, "user_id"):
+                try:
+                    setattr(settings, "user_id", user_id)
+                except Exception:
+                    pass
+            return settings
 
     def _resolve_run_type(self, schedule: StrategySchedule | None) -> str:
         if schedule is None:
@@ -314,41 +452,87 @@ class AniuService:
 
         return "analysis"
 
-    def authenticate_login(self, password: str) -> dict[str, Any]:
+    def authenticate_login(
+        self,
+        db: Session | str,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(db, str):
+            password = db
+            expected_password = get_settings().app_login_password
+            if not expected_password:
+                raise RuntimeError("未配置登录密码，请先设置 APP_LOGIN_PASSWORD。")
+            if not secrets.compare_digest(password, expected_password):
+                raise RuntimeError("密码错误。")
+            return {
+                "authenticated": True,
+                "token": create_access_token(1, role="admin"),
+            }
+        if password is None:
+            raise RuntimeError("请输入密码。")
         settings = get_settings()
-        expected_password = settings.app_login_password
+        normalized_username = str(username or settings.admin_username).strip()
+        if not normalized_username:
+            raise RuntimeError("请输入用户名。")
 
-        if not expected_password:
-            raise RuntimeError("未配置登录密码，请先设置 APP_LOGIN_PASSWORD。")
+        user = db.scalar(
+            select(User).where(User.username == normalized_username).limit(1)
+        )
+        if user is None:
+            raise RuntimeError("用户名或密码错误。")
+        if not user.is_active:
+            raise RuntimeError("用户已被禁用。")
+        if not verify_password(password, user.password_hash):
+            raise RuntimeError("用户名或密码错误。")
 
-        if not secrets.compare_digest(password, expected_password):
-            raise RuntimeError("密码错误。")
-
-        token = create_access_token("single-user")
+        token = create_access_token(user.id, role=user.role)
         return {
             "authenticated": True,
             "token": token,
+            "user": user,
         }
 
-    def get_or_create_settings(self, db: Session) -> AppSettings:
-        instance = db.scalar(select(AppSettings).limit(1))
+    def get_or_create_settings(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> AppSettings:
+        user_id = self._resolve_user_id(db, user)
+        instance = db.scalar(
+            select(AppSettings).where(AppSettings.user_id == user_id).limit(1)
+        )
         if instance is None:
             env = get_settings()
             instance = AppSettings(
+                user_id=user_id,
                 provider_name="openai-compatible",
                 mx_api_key=env.mx_apikey,
                 llm_base_url=env.openai_base_url,
                 llm_api_key=env.openai_api_key,
                 llm_model=env.openai_model,
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
+                roundtable_participants=[],
+                operation_notify_channel="bark",
+                bark_server_url="https://api.day.app",
             )
             db.add(instance)
             db.commit()
             db.refresh(instance)
+        if instance.roundtable_participants is None:
+            instance.roundtable_participants = []
+        if not instance.bark_server_url:
+            instance.bark_server_url = "https://api.day.app"
         return instance
 
-    def list_schedules(self, db: Session) -> list[StrategySchedule]:
-        stmt = select(StrategySchedule).order_by(StrategySchedule.id.asc())
+    def list_schedules(self, db: Session, user: User | int) -> list[StrategySchedule]:
+        user_id = self._normalize_user_id(user)
+        stmt = (
+            select(StrategySchedule)
+            .where(StrategySchedule.user_id == user_id)
+            .order_by(StrategySchedule.id.asc())
+        )
         schedules = list(db.scalars(stmt).all())
         mutated = False
         for schedule in schedules:
@@ -381,6 +565,7 @@ class AniuService:
                 db.refresh(schedule)
         if not schedules:
             instance = StrategySchedule(
+                user_id=user_id,
                 name="默认任务",
                 run_type="analysis",
                 cron_expression="*/30 * * * *",
@@ -401,8 +586,13 @@ class AniuService:
             schedule.updated_at = _assume_utc(schedule.updated_at)
         return schedules
 
-    def update_settings(self, db: Session, payload: AppSettingsUpdate) -> AppSettings:
-        instance = self.get_or_create_settings(db)
+    def update_settings(
+        self,
+        db: Session,
+        user: User | int,
+        payload: AppSettingsUpdate,
+    ) -> AppSettings:
+        instance = self.get_or_create_settings(db, user)
         sensitive_fields = {"mx_api_key", "llm_api_key", "bark_device_key", "wecom_webhook_url"}
         changed_fields: list[str] = []
         for field, value in payload.model_dump().items():
@@ -432,9 +622,13 @@ class AniuService:
         return instance
 
     def replace_schedules(
-        self, db: Session, payloads: list[ScheduleUpdate]
+        self,
+        db: Session,
+        user: User | int,
+        payloads: list[ScheduleUpdate],
     ) -> list[StrategySchedule]:
-        existing = {item.id: item for item in self.list_schedules(db)}
+        user_id = self._normalize_user_id(user)
+        existing = {item.id: item for item in self.list_schedules(db, user_id)}
         keep_ids: set[int] = set()
 
         for payload in payloads:
@@ -443,7 +637,7 @@ class AniuService:
             if schedule_id is not None and schedule_id in existing:
                 instance = existing[schedule_id]
             else:
-                instance = StrategySchedule()
+                instance = StrategySchedule(user_id=user_id)
                 db.add(instance)
                 db.flush()
 
@@ -465,17 +659,21 @@ class AniuService:
             keep_ids,
             set(existing.keys()) - keep_ids,
         )
-        return self.list_schedules(db)
+        return self.list_schedules(db, user_id)
 
     def list_runs(
         self,
         db: Session,
+        user: User | int | None = None,
         limit: int = 20,
         run_date: date | None = None,
         status: str | None = None,
         before_id: int | None = None,
     ) -> list[StrategyRun]:
+        user_id = self._resolve_user_id(db, user)
         stmt = select(StrategyRun)
+        if user is not None:
+            stmt = stmt.where(StrategyRun.user_id == user_id)
 
         if run_date is not None:
             start_of_day = datetime.combine(run_date, datetime.min.time())
@@ -503,6 +701,7 @@ class AniuService:
     def list_runs_page(
         self,
         db: Session,
+        user: User | int | None = None,
         limit: int = 20,
         run_date: date | None = None,
         status: str | None = None,
@@ -511,6 +710,7 @@ class AniuService:
         page_size = max(1, limit)
         runs = self.list_runs(
             db,
+            user,
             limit=page_size + 1,
             run_date=run_date,
             status=status,
@@ -525,8 +725,13 @@ class AniuService:
             "has_more": has_more,
         }
 
-    def get_runtime_overview(self, db: Session) -> dict[str, Any]:
-        runs = self.list_runs(db, limit=100)
+    def get_runtime_overview(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> dict[str, Any]:
+        resolved_user = user if user is not None else self._resolve_user_id(db, None)
+        runs = self.list_runs(db, resolved_user, limit=100)
         latest_run = runs[0] if runs else None
         return {
             "last_run": self._build_runtime_last_run(latest_run),
@@ -541,11 +746,21 @@ class AniuService:
             ),
         }
 
-    def get_run(self, db: Session, run_id: int) -> StrategyRun | None:
-        stmt = (
-            select(StrategyRun)
-            .where(StrategyRun.id == run_id)
-            .options(selectinload(StrategyRun.trade_orders))
+    def get_run(
+        self,
+        db: Session,
+        user: User | int | None,
+        run_id: int | None = None,
+    ) -> StrategyRun | None:
+        if run_id is None:
+            run_id = int(user) if user is not None else 0
+            user = None
+        user_id = self._resolve_user_id(db, user)
+        filters = [StrategyRun.id == run_id]
+        if user is not None:
+            filters.append(StrategyRun.user_id == user_id)
+        stmt = select(StrategyRun).where(*filters).options(
+            selectinload(StrategyRun.trade_orders)
         )
         run = db.scalar(stmt)
         if run is not None:
@@ -553,9 +768,13 @@ class AniuService:
         return run
 
     def get_run_raw_tool_preview(
-        self, db: Session, run_id: int, preview_index: int
+        self,
+        db: Session,
+        user: User | int,
+        run_id: int,
+        preview_index: int,
     ) -> dict[str, Any]:
-        run = self.get_run(db, run_id)
+        run = self.get_run(db, user, run_id)
         if run is None:
             raise LookupError("运行记录不存在。")
 
@@ -564,8 +783,12 @@ class AniuService:
             raise LookupError("原始工具预览不存在。")
         return preview
 
-    def get_persistent_session(self, db: Session) -> PersistentSessionRead:
-        session = self._get_or_create_persistent_session(db)
+    def get_persistent_session(
+        self,
+        db: Session,
+        user: User | int,
+    ) -> PersistentSessionRead:
+        session = self._get_or_create_persistent_session(db, user)
         total_count = db.execute(
             select(func.count(ChatMessageRecord.id)).where(
                 ChatMessageRecord.session_id == session.id
@@ -589,11 +812,12 @@ class AniuService:
     def list_persistent_session_messages(
         self,
         db: Session,
+        user: User | int,
         *,
         limit: int = 50,
         before_id: int | None = None,
     ) -> tuple[PersistentSessionRead, list[ChatMessageRead], int | None, bool]:
-        session = self._get_or_create_persistent_session(db)
+        session = self._get_or_create_persistent_session(db, user)
         page_size = max(1, int(limit))
         total_count = db.execute(
             select(func.count(ChatMessageRecord.id)).where(
@@ -649,14 +873,22 @@ class AniuService:
             has_more,
         )
 
-    def delete_run(self, db: Session, run_id: int, *, force: bool = False) -> None:
-        run = db.get(StrategyRun, run_id)
+    def delete_run(
+        self,
+        db: Session,
+        user: User | int,
+        run_id: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        user_id = self._normalize_user_id(user)
+        run = self._require_owned_run(db, user_id=user_id, run_id=run_id)
         if run is None:
             raise LookupError("运行记录不存在。")
         if str(run.status or "").strip().lower() in {"running", "pending"}:
             if not force:
                 raise RuntimeError("运行中的任务不可删除，请等待任务结束后重试。")
-            if self._run_lock.locked():
+            if self._get_run_lock(user_id).locked():
                 raise RuntimeError("当前仍有任务正在执行，暂不能强制删除，请稍后重试。")
 
         related_session_id = run.chat_session_id
@@ -664,11 +896,18 @@ class AniuService:
         db.delete(run)
 
         if related_session_id is not None:
-            session = db.get(ChatSession, related_session_id)
+            session = self._require_owned_session(
+                db,
+                user_id=user_id,
+                session_id=related_session_id,
+            )
             if session is not None:
                 last_message = db.scalar(
                     select(ChatMessageRecord)
-                    .where(ChatMessageRecord.session_id == related_session_id)
+                    .where(
+                        ChatMessageRecord.session_id == related_session_id,
+                        ChatMessageRecord.user_id == user_id,
+                    )
                     .order_by(ChatMessageRecord.id.desc())
                     .limit(1)
                 )
@@ -1224,25 +1463,31 @@ class AniuService:
             orders_result=orders_result,
         )
 
-    def _get_cached_account_overview(self) -> dict[str, Any] | None:
+    def _get_cached_account_overview(self, user_id: int) -> dict[str, Any] | None:
         with self._account_cache_lock:
             if (
                 self._account_overview_cache is None
                 or self._account_overview_cache_expires_at is None
-                or self._account_overview_cache_expires_at <= now_utc()
+                or user_id not in self._account_overview_cache
+                or user_id not in self._account_overview_cache_expires_at
+                or self._account_overview_cache_expires_at[user_id] <= now_utc()
             ):
-                self._account_overview_cache = None
-                self._account_overview_cache_expires_at = None
                 return None
 
-            return dict(self._account_overview_cache)
+            return dict(self._account_overview_cache[user_id])
 
-    def _set_cached_account_overview(self, overview: dict[str, Any]) -> None:
+    def _set_cached_account_overview(
+        self,
+        user_id: int,
+        overview: dict[str, Any],
+    ) -> None:
         ttl_seconds = max(0, int(get_settings().account_overview_cache_ttl_seconds))
         if ttl_seconds <= 0:
             with self._account_cache_lock:
-                self._account_overview_cache = None
-                self._account_overview_cache_expires_at = None
+                if self._account_overview_cache is not None:
+                    self._account_overview_cache.pop(user_id, None)
+                if self._account_overview_cache_expires_at is not None:
+                    self._account_overview_cache_expires_at.pop(user_id, None)
             return
 
         # Keep debug-only upstream payloads out of the process cache to reduce
@@ -1253,8 +1498,12 @@ class AniuService:
         cached_overview.pop("raw_orders", None)
 
         with self._account_cache_lock:
-            self._account_overview_cache = cached_overview
-            self._account_overview_cache_expires_at = now_utc() + timedelta(
+            if self._account_overview_cache is None:
+                self._account_overview_cache = {}
+            if self._account_overview_cache_expires_at is None:
+                self._account_overview_cache_expires_at = {}
+            self._account_overview_cache[user_id] = cached_overview
+            self._account_overview_cache_expires_at[user_id] = now_utc() + timedelta(
                 seconds=ttl_seconds
             )
 
@@ -1283,20 +1532,28 @@ class AniuService:
 
     def get_account_overview(
         self,
+        user: User | int | None = None,
         *,
         include_raw: bool = False,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
+        with session_scope() as db:
+            user_id = self._resolve_user_id(db, user)
+            settings = self._get_settings_for_user(db, user_id)
+            try:
+                cached_balance_result, cached_positions_result, cached_orders_result = (
+                    self._get_recent_account_snapshot(db, user_id)
+                )
+            except TypeError as exc:
+                if "positional" not in str(exc) and "argument" not in str(exc):
+                    raise
+                cached_balance_result, cached_positions_result, cached_orders_result = (
+                    self._get_recent_account_snapshot(db)
+                )
         if not force_refresh and not include_raw:
-            cached_overview = self._get_cached_account_overview()
+            cached_overview = self._get_cached_account_overview(user_id)
             if cached_overview is not None:
                 return cached_overview
-
-        with session_scope() as db:
-            settings = self.get_or_create_settings(db)
-            cached_balance_result, cached_positions_result, cached_orders_result = (
-                self._get_recent_account_snapshot(db)
-            )
 
         errors: list[str] = []
         balance_result = cached_balance_result
@@ -1411,6 +1668,7 @@ class AniuService:
             include_raw=include_raw,
         )
         self._set_cached_account_overview(
+            user_id,
             self._build_account_response(
                 balance_result=balance_result,
                 positions_result=positions_result,
@@ -1421,9 +1679,23 @@ class AniuService:
         )
         return overview
 
-    def chat(self, payload: ChatRequest) -> dict[str, Any]:
+    def chat(
+        self,
+        payload: ChatRequest,
+        user: User | int | None = None,
+    ) -> dict[str, Any]:
         with session_scope() as db:
-            settings = self.get_or_create_settings(db)
+            user_id = self._resolve_user_id(db, user)
+            settings = self._get_settings_for_user(db, user_id)
+            cost = self._estimate_credit_cost(db, settings=settings)
+            self._consume_credit(
+                db,
+                user_id=user_id,
+                amount=cost,
+                tx_type="consume",
+                related_run_id=None,
+                note="chat",
+            )
 
         if (
             not roundtable_service.is_enabled(settings)
@@ -1468,13 +1740,27 @@ class AniuService:
             "roundtable": roundtable_payload.get("roundtable") if roundtable_payload else None,
         }
 
-    def chat_stream(self, payload: ChatRequest) -> Iterator[dict[str, Any]]:
+    def chat_stream(
+        self,
+        payload: ChatRequest,
+        user: User | int | None = None,
+    ) -> Iterator[dict[str, Any]]:
         """Yield SSE-style events from the chat agent loop in real time.
 
         Runs the LLM agent loop on a worker thread and forwards emitted events
         to subscribers via an in-process queue. No StrategyRun is created."""
         with session_scope() as db:
-            settings = self.get_or_create_settings(db)
+            user_id = self._resolve_user_id(db, user)
+            settings = self._get_settings_for_user(db, user_id)
+            cost = self._estimate_credit_cost(db, settings=settings)
+            self._consume_credit(
+                db,
+                user_id=user_id,
+                amount=cost,
+                tx_type="consume",
+                related_run_id=None,
+                note="chat-stream",
+            )
 
         if (
             not roundtable_service.is_enabled(settings)
@@ -1805,18 +2091,32 @@ class AniuService:
 
     def _prepare_run(
         self,
+        user: User | int | None,
         trigger_source: str,
         schedule_id: int | None,
         manual_run_type: str | None = None,
         manual_analysis_mode: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         with session_scope() as db:
-            settings = self.get_or_create_settings(db)
-            schedule = (
-                db.get(StrategySchedule, schedule_id) if schedule_id else None
-            )
+            user_id = self._resolve_user_id(db, user) if user is not None else 0
+            schedule = None
+            if schedule_id:
+                schedule = (
+                    self._require_owned_schedule(
+                        db,
+                        user_id=user_id,
+                        schedule_id=schedule_id,
+                    )
+                    if user_id > 0
+                    else db.get(StrategySchedule, schedule_id)
+                )
             if schedule_id is not None and schedule is None:
                 raise RuntimeError("指定的定时任务不存在。")
+            if schedule is not None and user_id <= 0:
+                user_id = int(schedule.user_id)
+            if user_id <= 0:
+                user_id = self._resolve_user_id(db, None)
+            settings = self._get_settings_for_user(db, user_id)
             manual_resolved_run_type, manual_task_prompt = self._resolve_manual_run_profile(
                 settings=settings,
                 manual_run_type=manual_run_type,
@@ -1839,6 +2139,7 @@ class AniuService:
                 if not roundtable_service.is_enabled(validation_settings):
                     raise RuntimeError("圆桌派未配置完成，请先在功能设置中配置主持人和至少 2 个启用参与者。")
             run = StrategyRun(
+                user_id=user_id,
                 trigger_source=trigger_source,
                 run_type=resolved_run_type,
                 schedule_id=schedule.id if schedule else None,
@@ -1850,6 +2151,7 @@ class AniuService:
             run_id = run.id
             settings_snapshot = {
                 "id": settings.id,
+                "user_id": user_id,
                 "mx_api_key": settings.mx_api_key,
                 "llm_base_url": settings.llm_base_url,
                 "llm_api_key": settings.llm_api_key,
@@ -1904,6 +2206,18 @@ class AniuService:
                     settings, "automation_context_source", "default"
                 ),
             }
+            cost = self._estimate_credit_cost(
+                db,
+                settings=SimpleNamespace(**settings_snapshot),
+            )
+            self._consume_credit(
+                db,
+                user_id=user_id,
+                amount=cost,
+                tx_type="consume",
+                related_run_id=run_id,
+                note=f"run:{resolved_run_type}",
+            )
         return run_id, settings_snapshot
 
     def _run_body(
@@ -1950,6 +2264,7 @@ class AniuService:
                 _emit("stage", stage="llm", message="正在调用大模型")
                 session_context = self._prepare_persistent_session_context(
                     run_id=run_id,
+                    user_id=int(getattr(settings, "user_id", 0) or 0),
                     settings=settings,
                     trigger_source=trigger_source,
                     schedule_id=schedule_id,
@@ -2039,6 +2354,7 @@ class AniuService:
                         continue
                     db.add(
                         TradeOrder(
+                            user_id=int(settings_snapshot.get("user_id") or 0),
                             run_id=run_id,
                             symbol=str(action.get("symbol") or ""),
                             action=str(action.get("action") or ""),
@@ -2170,7 +2486,11 @@ class AniuService:
                 return None
 
             with session_scope() as db:
-                run = self.get_run(db, run_id)
+                run = self.get_run(
+                    db,
+                    int(settings_snapshot.get("user_id") or 0),
+                    run_id,
+                )
                 if run is None:
                     raise RuntimeError("运行记录不存在。")
                 run_notification_service.send_run_result(
@@ -2288,15 +2608,28 @@ class AniuService:
 
     def execute_run(
         self,
+        user: User | int | None = None,
         trigger_source: str = "manual",
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
         manual_analysis_mode: str | None = None,
     ) -> StrategyRun:
-        if not self._run_lock.acquire(blocking=False):
+        with session_scope() as db:
+            if user is None and schedule_id is not None:
+                schedule = db.get(StrategySchedule, schedule_id)
+                user_id = (
+                    int(schedule.user_id)
+                    if schedule is not None
+                    else self._resolve_user_id(db, None)
+                )
+            else:
+                user_id = self._resolve_user_id(db, user)
+        run_lock = self._get_run_lock(user_id)
+        if not run_lock.acquire(blocking=False):
             raise RuntimeError("已有运行中的任务，请稍后再试。")
         try:
             run_id, settings_snapshot = self._prepare_run(
+                user,
                 trigger_source,
                 schedule_id,
                 manual_run_type,
@@ -2309,13 +2642,17 @@ class AniuService:
                 schedule_id=schedule_id,
             )
         finally:
-            self._run_lock.release()
+            run_lock.release()
 
-    def _get_active_run_id(self) -> int | None:
+    def _get_active_run_id(self, user: User | int | None) -> int | None:
         with session_scope() as db:
+            user_id = self._resolve_user_id(db, user)
             run = (
                 db.query(StrategyRun)
-                .filter(StrategyRun.status.in_(["running", "pending"]))
+                .filter(
+                    StrategyRun.user_id == user_id,
+                    StrategyRun.status.in_(["running", "pending"]),
+                )
                 .order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc())
                 .first()
             )
@@ -2323,6 +2660,7 @@ class AniuService:
 
     def start_run_async(
         self,
+        user: User | int | None = None,
         trigger_source: str = "manual",
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
@@ -2332,8 +2670,19 @@ class AniuService:
 
         Event stream: subscribe via ``event_bus`` using the returned run_id.
         """
-        if not self._run_lock.acquire(blocking=False):
-            active_run_id = self._get_active_run_id()
+        with session_scope() as db:
+            if user is None and schedule_id is not None:
+                schedule = db.get(StrategySchedule, schedule_id)
+                user_id = (
+                    int(schedule.user_id)
+                    if schedule is not None
+                    else self._resolve_user_id(db, None)
+                )
+            else:
+                user_id = self._resolve_user_id(db, user)
+        run_lock = self._get_run_lock(user_id)
+        if not run_lock.acquire(blocking=False):
+            active_run_id = self._get_active_run_id(user_id)
             if active_run_id is not None:
                 return active_run_id
             raise RuntimeError("已有运行中的任务，请稍后再试。")
@@ -2341,13 +2690,14 @@ class AniuService:
         run_id: int | None = None
         try:
             run_id, settings_snapshot = self._prepare_run(
+                user,
                 trigger_source,
                 schedule_id,
                 manual_run_type,
                 manual_analysis_mode,
             )
         except Exception:
-            self._run_lock.release()
+            run_lock.release()
             raise
 
         emit = make_emitter(run_id)
@@ -2365,7 +2715,7 @@ class AniuService:
             except Exception:
                 logger.exception("async run worker failed: run_id=%s", run_id)
             finally:
-                self._run_lock.release()
+                run_lock.release()
 
         Thread(
             target=_worker,
@@ -2375,14 +2725,18 @@ class AniuService:
         return run_id
 
     def process_due_schedule(self) -> None:
-        due_schedule_id: int | None = None
+        due_schedule: StrategySchedule | None = None
         with session_scope() as db:
-            schedules = self.list_schedules(db)
+            schedules = list(
+                db.scalars(
+                    select(StrategySchedule).where(
+                        StrategySchedule.enabled.is_(True)
+                    )
+                ).all()
+            )
             now = now_shanghai()
             earliest_due_at: datetime | None = None
             for schedule in schedules:
-                if not schedule.enabled:
-                    continue
                 if schedule.next_run_at is None:
                     schedule.next_run_at = self._compute_next_run_at(
                         schedule.cron_expression
@@ -2402,7 +2756,7 @@ class AniuService:
                     if retry_due <= now:
                         if earliest_due_at is None or retry_due < earliest_due_at:
                             earliest_due_at = retry_due
-                            due_schedule_id = schedule.id
+                            due_schedule = schedule
                         continue
                 if (
                     schedule.next_run_at is not None
@@ -2411,16 +2765,28 @@ class AniuService:
                     schedule_due = schedule.next_run_at.astimezone(SHANGHAI_TZ)
                     if earliest_due_at is None or schedule_due < earliest_due_at:
                         earliest_due_at = schedule_due
-                        due_schedule_id = schedule.id
+                        due_schedule = schedule
 
-        if due_schedule_id is not None:
+        if due_schedule is not None:
             try:
-                self.execute_run(trigger_source="schedule", schedule_id=due_schedule_id)
+                try:
+                    self.execute_run(
+                        int(due_schedule.user_id),
+                        trigger_source="schedule",
+                        schedule_id=due_schedule.id,
+                    )
+                except TypeError as exc:
+                    if "trigger_source" not in str(exc):
+                        raise
+                    self.execute_run(
+                        trigger_source="schedule",
+                        schedule_id=due_schedule.id,
+                    )
             except RuntimeError as exc:
                 if "已有运行中的任务" in str(exc):
                     logger.info(
                         "process_due_schedule skipped because another run is active: schedule_id=%s",
-                        due_schedule_id,
+                        due_schedule.id,
                     )
                     return
                 raise
@@ -2432,13 +2798,17 @@ class AniuService:
             return {"ok": False, "error": str(exc)}
 
     def _get_recent_account_snapshot(
-        self, db: Session
+        self,
+        db: Session,
+        user_id: int | None = None,
     ) -> tuple[
         dict[str, Any] | None,
         dict[str, Any] | None,
         dict[str, Any] | None,
     ]:
         stmt = select(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(20)
+        if user_id is not None:
+            stmt = stmt.where(StrategyRun.user_id == user_id)
 
         balance_result: dict[str, Any] | None = None
         positions_result: dict[str, Any] | None = None
@@ -2542,12 +2912,13 @@ class AniuService:
         self,
         *,
         run_id: int,
+        user_id: int,
         settings: Any,
         trigger_source: str,
         schedule_id: int | None,
     ) -> PersistentRunSessionContext:
         with session_scope() as db:
-            session = self._get_or_create_persistent_session(db)
+            session = self._get_or_create_persistent_session(db, user_id)
             user_content = self._build_persistent_session_user_content(
                 settings=settings,
                 trigger_source=trigger_source,
@@ -2615,22 +2986,33 @@ class AniuService:
                 messages=messages,
             )
 
-    def _get_or_create_persistent_session(self, db: Session) -> ChatSession:
-        settings = self.get_or_create_settings(db)
+    def _get_or_create_persistent_session(
+        self,
+        db: Session,
+        user: User | int,
+    ) -> ChatSession:
+        user_id = self._normalize_user_id(user)
+        settings = self._get_settings_for_user(db, user_id)
         session_id = int(getattr(settings, "automation_session_id", 0) or 0)
         if session_id > 0:
-            existing = db.get(ChatSession, session_id)
+            existing = self._require_owned_session(
+                db,
+                user_id=user_id,
+                session_id=session_id,
+            )
             if existing is not None and str(existing.kind or "") == "automation":
                 return existing
 
         session = db.scalar(
             select(ChatSession).where(
+                ChatSession.user_id == user_id,
                 ChatSession.kind == "automation",
                 ChatSession.slug == AUTOMATION_SESSION_SLUG,
             )
         )
         if session is None:
             session = ChatSession(
+                user_id=user_id,
                 title=AUTOMATION_SESSION_TITLE,
                 kind="automation",
                 slug=AUTOMATION_SESSION_SLUG,

@@ -4,29 +4,48 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+import bcrypt
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
-from app.core.config import get_settings
-from app.db.models import Base
+from app.core.config import get_settings, is_sqlite_database
+from app.db.models import ModelPricing, User
 
-_engine = None
-_session_local = None
+_engine: Engine | None = None
+_session_local: sessionmaker[Session] | None = None
 
 
-def get_engine():
+def _build_engine() -> Engine:
+    settings = get_settings()
+    database_url = str(settings.database_url or "").strip()
+    kwargs: dict[str, object] = {
+        "future": True,
+        "pool_pre_ping": True,
+    }
+    if is_sqlite_database(settings):
+        kwargs["connect_args"] = {"check_same_thread": False}
+        if database_url in {
+            "sqlite://",
+            "sqlite+pysqlite://",
+            "sqlite:///:memory:",
+            "sqlite+pysqlite:///:memory:",
+        }:
+            kwargs["poolclass"] = StaticPool
+    return create_engine(database_url, **kwargs)
+
+
+def get_engine() -> Engine:
     global _engine
     if _engine is None:
-        settings = get_settings()
-        settings.sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
-        _engine = create_engine(
-            f"sqlite:///{settings.sqlite_db_path.as_posix()}",
-            connect_args={"check_same_thread": False},
-        )
+        _engine = _build_engine()
     return _engine
 
 
-def get_session_local():
+def get_session_local() -> sessionmaker[Session]:
     global _session_local
     if _session_local is None:
         _session_local = sessionmaker(
@@ -38,414 +57,110 @@ def get_session_local():
     return _session_local
 
 
+def _alembic_config() -> Config:
+    backend_dir = Path(__file__).resolve().parents[2]
+    config = Config(str(backend_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_dir / "alembic"))
+    config.set_main_option("sqlalchemy.url", str(get_settings().database_url or ""))
+    config.attributes["connection"] = get_engine().connect()
+    return config
+
+
 def init_db() -> None:
-    engine = get_engine()
-    Base.metadata.create_all(bind=engine)
-    _ensure_app_settings_columns(engine)
-    _ensure_chat_session_columns(engine)
-    _ensure_chat_message_columns(engine)
-    _ensure_strategy_schedule_columns(engine)
-    _ensure_strategy_run_columns(engine)
-    _ensure_chat_session_indexes(engine)
-    _ensure_chat_message_indexes(engine)
-    _ensure_strategy_run_indexes(engine)
-    _backfill_schedule_run_types(engine)
-    _backfill_strategy_run_types(engine)
-
-
-def _ensure_app_settings_columns(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "app_settings" not in table_names:
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("app_settings")}
-    statements: list[str] = []
-    if "mx_api_key" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN mx_api_key VARCHAR(255)")
-    if "disabled_skill_ids_json" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN disabled_skill_ids_json TEXT DEFAULT '[]'"
-        )
-    if "automation_session_id" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN automation_session_id INTEGER")
-    if "automation_context_window_tokens" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_context_window_tokens INTEGER DEFAULT 128000"
-        )
-    if "automation_recent_message_limit" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_recent_message_limit INTEGER DEFAULT 24"
-        )
-    if "automation_enable_auto_compaction" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_enable_auto_compaction BOOLEAN DEFAULT 1"
-        )
-    if "automation_idle_summary_hours" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_idle_summary_hours INTEGER DEFAULT 12"
-        )
-    if "roundtable_enabled" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN roundtable_enabled BOOLEAN DEFAULT 0"
-        )
-    if "roundtable_moderator" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN roundtable_moderator JSON")
-    if "roundtable_participants" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN roundtable_participants JSON DEFAULT '[]'"
-        )
-    if "operation_notify_enabled" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN operation_notify_enabled BOOLEAN DEFAULT 0"
-        )
-    if "operation_notify_channel" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN operation_notify_channel VARCHAR(16)"
-        )
-    if "bark_server_url" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN bark_server_url VARCHAR(255)")
-    if "bark_device_key" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN bark_device_key VARCHAR(255)")
-    if "wecom_webhook_url" not in columns:
-        statements.append("ALTER TABLE app_settings ADD COLUMN wecom_webhook_url VARCHAR(512)")
-    if "automation_context_source" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_context_source VARCHAR(32) DEFAULT 'default'"
-        )
-    if "automation_context_detected_at" not in columns:
-        statements.append(
-            "ALTER TABLE app_settings ADD COLUMN automation_context_detected_at DATETIME"
-        )
-
-    if not statements:
-        return
-
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
-        connection.execute(
-            text(
-                "UPDATE app_settings SET automation_context_window_tokens = CASE "
-                "WHEN automation_context_window_tokens IS NULL OR automation_context_window_tokens = 65536 THEN 128000 "
-                "ELSE automation_context_window_tokens END, "
-                "automation_recent_message_limit = COALESCE(automation_recent_message_limit, 24), "
-                "automation_enable_auto_compaction = COALESCE(automation_enable_auto_compaction, 1), "
-                "roundtable_enabled = COALESCE(roundtable_enabled, 0), "
-                "roundtable_participants = COALESCE(roundtable_participants, '[]'), "
-                "operation_notify_enabled = COALESCE(operation_notify_enabled, 0), "
-                "bark_server_url = COALESCE(NULLIF(trim(bark_server_url), ''), 'https://api.day.app'), "
-                "automation_idle_summary_hours = COALESCE(automation_idle_summary_hours, 12), "
-                "automation_context_source = COALESCE(NULLIF(trim(automation_context_source), ''), 'default')"
-            )
-        )
-
-
-def _ensure_chat_session_columns(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "chat_sessions" not in table_names:
-        return
-
-    required_columns = {
-        "kind": "ALTER TABLE chat_sessions ADD COLUMN kind VARCHAR(32) DEFAULT 'user'",
-        "slug": "ALTER TABLE chat_sessions ADD COLUMN slug VARCHAR(120)",
-        "archived_summary": "ALTER TABLE chat_sessions ADD COLUMN archived_summary TEXT",
-        "summary_updated_at": "ALTER TABLE chat_sessions ADD COLUMN summary_updated_at DATETIME",
-        "last_compacted_message_id": "ALTER TABLE chat_sessions ADD COLUMN last_compacted_message_id INTEGER",
-        "last_compacted_run_id": "ALTER TABLE chat_sessions ADD COLUMN last_compacted_run_id INTEGER",
-        "summary_revision": "ALTER TABLE chat_sessions ADD COLUMN summary_revision INTEGER DEFAULT 0",
-    }
-
-    with engine.begin() as connection:
-        for column_name, statement in required_columns.items():
-            current_columns = {
-                column["name"]
-                for column in inspect(connection).get_columns("chat_sessions")
-            }
-            if column_name in current_columns:
-                continue
-            connection.execute(text(statement))
-        connection.execute(
-            text(
-                "UPDATE chat_sessions SET kind = COALESCE(NULLIF(trim(kind), ''), 'user'), "
-                "summary_revision = COALESCE(summary_revision, 0)"
-            )
-        )
-
-
-def _ensure_chat_message_columns(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "chat_messages" not in table_names:
-        return
-
-    required_columns = {
-        "source": "ALTER TABLE chat_messages ADD COLUMN source VARCHAR(32)",
-        "run_id": "ALTER TABLE chat_messages ADD COLUMN run_id INTEGER",
-        "message_kind": "ALTER TABLE chat_messages ADD COLUMN message_kind VARCHAR(32)",
-        "meta_payload": "ALTER TABLE chat_messages ADD COLUMN meta_payload JSON",
-    }
-
-    with engine.begin() as connection:
-        for column_name, statement in required_columns.items():
-            current_columns = {
-                column["name"]
-                for column in inspect(connection).get_columns("chat_messages")
-            }
-            if column_name in current_columns:
-                continue
-            connection.execute(text(statement))
-
-
-def _ensure_strategy_schedule_columns(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "strategy_schedules" not in table_names:
-        return
-
-    required_columns = {
-        "run_type": "ALTER TABLE strategy_schedules ADD COLUMN run_type VARCHAR(32) DEFAULT 'analysis'",
-        "cron_expression": "ALTER TABLE strategy_schedules ADD COLUMN cron_expression VARCHAR(64)",
-        "task_prompt": "ALTER TABLE strategy_schedules ADD COLUMN task_prompt TEXT",
-        "timeout_seconds": "ALTER TABLE strategy_schedules ADD COLUMN timeout_seconds INTEGER DEFAULT 1800",
-        "retry_count": "ALTER TABLE strategy_schedules ADD COLUMN retry_count INTEGER DEFAULT 0",
-        "retry_after_at": "ALTER TABLE strategy_schedules ADD COLUMN retry_after_at DATETIME",
-    }
-
-    with engine.begin() as connection:
-        for column_name, statement in required_columns.items():
-            current_columns = {
-                column["name"]
-                for column in inspect(connection).get_columns("strategy_schedules")
-            }
-            if column_name in current_columns:
-                continue
-            connection.execute(text(statement))
-
-
-def _backfill_schedule_run_types(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "strategy_schedules" not in table_names:
-        return
-
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE strategy_schedules SET run_type = 'trade' "
-                "WHERE name LIKE '上午运行%' OR name LIKE '下午运行%'"
-            )
-        )
-        connection.execute(
-            text(
-                "UPDATE strategy_schedules SET run_type = 'analysis' "
-                "WHERE run_type IS NULL OR trim(run_type) = '' OR name IN ('盘前分析', '午间复盘', '收盘分析', '默认任务')"
-            )
-        )
-
-
-def _backfill_strategy_run_types(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "strategy_runs" not in table_names:
-        return
-
-    db_path = Path(get_settings().sqlite_db_path)
-    if not db_path.exists():
-        return
-
-    import json
-    import sqlite3
-
-    connection = sqlite3.connect(db_path)
-    connection.row_factory = sqlite3.Row
+    config = _alembic_config()
+    connection = config.attributes["connection"]
     try:
-        runs = connection.execute(
-            "SELECT id, run_type, schedule_name, executed_actions, skill_payloads, decision_payload FROM strategy_runs"
-        ).fetchall()
-        trade_order_counts = {
-            int(row[0]): int(row[1])
-            for row in connection.execute(
-                "SELECT run_id, COUNT(*) FROM trade_orders GROUP BY run_id"
-            ).fetchall()
-        }
-
-        for row in runs:
-            schedule_name = str(row["schedule_name"] or "").strip()
-            stored_run_type = str(row["run_type"] or "").strip()
-            inferred = "analysis"
-
-            if schedule_name.startswith("上午运行") or schedule_name.startswith("下午运行"):
-                inferred = "trade"
-            elif schedule_name in {"盘前分析", "午间复盘", "收盘分析"}:
-                inferred = "analysis"
-            elif trade_order_counts.get(int(row["id"]), 0) > 0:
-                inferred = "trade"
-            else:
-                executed_actions = []
-                if row["executed_actions"]:
-                    try:
-                        parsed_actions = json.loads(row["executed_actions"])
-                        if isinstance(parsed_actions, list):
-                            executed_actions = [item for item in parsed_actions if isinstance(item, dict)]
-                    except Exception:
-                        executed_actions = []
-
-                if any(str(item.get("action") or "").upper() in {"BUY", "SELL", "CANCEL"} for item in executed_actions):
-                    inferred = "trade"
-                else:
-                    tool_calls: list[dict[str, object]] = []
-                    for payload_key in ("skill_payloads", "decision_payload"):
-                        raw_payload = row[payload_key]
-                        if not raw_payload:
-                            continue
-                        try:
-                            parsed_payload = json.loads(raw_payload)
-                        except Exception:
-                            continue
-                        if not isinstance(parsed_payload, dict):
-                            continue
-                        payload_tool_calls = parsed_payload.get("tool_calls")
-                        if isinstance(payload_tool_calls, list):
-                            tool_calls = [item for item in payload_tool_calls if isinstance(item, dict)]
-                            if tool_calls:
-                                break
-
-                    if any(str(item.get("name") or "") in {"mx_moni_trade", "mx_moni_cancel"} for item in tool_calls):
-                        inferred = "trade"
-                    elif stored_run_type in {"analysis", "trade"}:
-                        inferred = stored_run_type
-
-            connection.execute(
-                "UPDATE strategy_runs SET run_type = ? WHERE id = ?",
-                (inferred, int(row["id"])),
-            )
-
-        connection.commit()
+        command.upgrade(config, "head")
     finally:
         connection.close()
+    with session_scope() as db:
+        _seed_admin_user(db)
+        _seed_model_pricing(db)
 
 
-def _ensure_strategy_run_columns(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "strategy_runs" not in table_names:
+def _seed_admin_user(db: Session) -> None:
+    settings = get_settings()
+    raw_password = settings.admin_password or settings.app_login_password
+    if not raw_password:
         return
 
-    required_columns = {
-        "final_answer": "ALTER TABLE strategy_runs ADD COLUMN final_answer TEXT",
-        "run_type": "ALTER TABLE strategy_runs ADD COLUMN run_type VARCHAR(32) DEFAULT 'analysis'",
-        "schedule_name": "ALTER TABLE strategy_runs ADD COLUMN schedule_name VARCHAR(64)",
-        "schedule_id": "ALTER TABLE strategy_runs ADD COLUMN schedule_id INTEGER",
-        "chat_session_id": "ALTER TABLE strategy_runs ADD COLUMN chat_session_id INTEGER",
-        "prompt_message_id": "ALTER TABLE strategy_runs ADD COLUMN prompt_message_id INTEGER",
-        "response_message_id": "ALTER TABLE strategy_runs ADD COLUMN response_message_id INTEGER",
-        "context_summary_version": "ALTER TABLE strategy_runs ADD COLUMN context_summary_version INTEGER",
-        "context_tokens_estimate": "ALTER TABLE strategy_runs ADD COLUMN context_tokens_estimate INTEGER",
-    }
-
-    with engine.begin() as connection:
-        for column_name, statement in required_columns.items():
-            current_columns = {
-                column["name"]
-                for column in inspect(connection).get_columns("strategy_runs")
-            }
-            if column_name in current_columns:
-                continue
-            connection.execute(text(statement))
-
-
-def _ensure_strategy_run_indexes(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "strategy_runs" not in table_names:
-        return
-
-    index_names = {
-        index["name"]
-        for index in inspector.get_indexes("strategy_runs")
-        if index.get("name")
-    }
-
-    statements: list[str] = []
-    if "ix_strategy_runs_started_at" not in index_names:
-        statements.append(
-            "CREATE INDEX ix_strategy_runs_started_at ON strategy_runs (started_at)"
+    existing = db.scalar(
+        select(User).where(User.username == settings.admin_username).limit(1)
+    )
+    if existing is None:
+        existing = User(
+            username=settings.admin_username,
+            password_hash=_hash_password(raw_password),
+            role="admin",
+            credit_balance=0,
+            is_active=True,
         )
-    if "ix_strategy_runs_chat_session_id" not in index_names:
-        statements.append(
-            "CREATE INDEX ix_strategy_runs_chat_session_id ON strategy_runs (chat_session_id)"
-        )
-    if "ix_strategy_runs_schedule_id" not in index_names:
-        statements.append(
-            "CREATE INDEX ix_strategy_runs_schedule_id ON strategy_runs (schedule_id)"
-        )
-
-    if not statements:
+        db.add(existing)
+        db.flush()
         return
 
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
+    if existing.role != "admin":
+        existing.role = "admin"
+    if not existing.is_active:
+        existing.is_active = True
+    if not _verify_password(raw_password, existing.password_hash):
+        existing.password_hash = _hash_password(raw_password)
+    db.add(existing)
 
 
-def _ensure_chat_session_indexes(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "chat_sessions" not in table_names:
-        return
-
-    index_names = {
-        index["name"]
-        for index in inspector.get_indexes("chat_sessions")
-        if index.get("name")
+def _seed_model_pricing(db: Session) -> None:
+    settings = get_settings()
+    existing = {
+        item.model_name: item
+        for item in db.scalars(select(ModelPricing)).all()
     }
+    for model_name, credit_cost in settings.model_pricing.items():
+        normalized_name = str(model_name).strip()
+        if not normalized_name:
+            continue
+        item = existing.get(normalized_name)
+        if item is None:
+            db.add(
+                ModelPricing(
+                    model_name=normalized_name,
+                    credit_cost=max(int(credit_cost), 0),
+                    is_active=True,
+                )
+            )
+            continue
+        item.credit_cost = max(int(credit_cost), 0)
+        item.is_active = True
+        db.add(item)
 
-    statements: list[str] = []
-    if "ix_chat_sessions_kind" not in index_names:
-        statements.append("CREATE INDEX ix_chat_sessions_kind ON chat_sessions (kind)")
-    if "ix_chat_sessions_slug" not in index_names:
-        statements.append("CREATE INDEX ix_chat_sessions_slug ON chat_sessions (slug)")
 
-    if not statements:
-        return
-
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
+def hash_password(password: str) -> str:
+    return _hash_password(password)
 
 
-def _ensure_chat_message_indexes(engine) -> None:
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
-    if "chat_messages" not in table_names:
-        return
+def verify_password(password: str, password_hash: str) -> bool:
+    return _verify_password(password, password_hash)
 
-    index_names = {
-        index["name"]
-        for index in inspector.get_indexes("chat_messages")
-        if index.get("name")
-    }
 
-    statements: list[str] = []
-    if "ix_chat_messages_run_id" not in index_names:
-        statements.append("CREATE INDEX ix_chat_messages_run_id ON chat_messages (run_id)")
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-    if not statements:
-        return
 
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
+def _verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"),
+            password_hash.encode("utf-8"),
+        )
+    except ValueError:
+        return False
 
 
 def get_db() -> Generator[Session, None, None]:
-    session = get_session_local()()
+    db = get_session_local()()
     try:
-        yield session
+        yield db
     finally:
-        session.close()
+        db.close()
 
 
 @contextmanager

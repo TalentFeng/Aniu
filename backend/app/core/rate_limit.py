@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import Request, status
 from starlette.responses import JSONResponse
 
+from app.core.auth import get_token_user_id
 from app.core.config import get_settings
 
 
@@ -109,8 +110,14 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Any:
     rule = _match_route_limit(path)
     if rule is not None:
         bucket_name, window, limit = rule
-        client_ip = get_client_ip(request)
-        key = f"{client_ip}:{bucket_name}"
+        key_subject = None
+        if path != "/api/aniu/login":
+            auth_header = request.headers.get("authorization") or ""
+            if auth_header.lower().startswith("bearer "):
+                key_subject = get_token_user_id(auth_header[7:].strip())
+        if key_subject is None:
+            key_subject = get_client_ip(request)
+        key = f"{key_subject}:{bucket_name}"
         if not _limiter.check(key, window, limit):
             return JSONResponse(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,

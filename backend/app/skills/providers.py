@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_skill_workspace_root, get_uploads_root
 from app.db.database import session_scope
 
 
@@ -53,6 +54,21 @@ def build_skill_context(
         "builtin_skills_root",
         str(Path(__file__).resolve().parents[2] / "skills"),
     )
+    user_id = getattr(app_settings_value, "user_id", None)
+    if user_id is not None:
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            normalized_user_id = None
+        if normalized_user_id is not None:
+            skill_runtime_paths.setdefault(
+                "workspace_root",
+                str(get_skill_workspace_root(user_id=normalized_user_id)),
+            )
+            skill_runtime_paths.setdefault(
+                "chat_uploads_root",
+                str(get_uploads_root(user_id=normalized_user_id)),
+            )
     context["skill_runtime_paths"] = skill_runtime_paths
 
     return context

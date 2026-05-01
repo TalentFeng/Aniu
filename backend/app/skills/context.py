@@ -71,7 +71,11 @@ def get_skill_runtime_paths(
 
         settings = get_settings()
         workspace_root = get_skill_workspace_root(settings)
-        chat_uploads_root = get_runtime_data_dir(settings) / "chat_uploads"
+        chat_uploads_root = (
+            get_runtime_data_dir(settings) / "chat_uploads"
+            if getattr(settings, "sqlite_db_path", None) is None
+            else settings.sqlite_db_path.parent / "chat_uploads"
+        )
     except Exception:
         workspace_root = Path.cwd() / "data" / "skill_workspace"
         chat_uploads_root = Path.cwd() / "data" / "chat_uploads"

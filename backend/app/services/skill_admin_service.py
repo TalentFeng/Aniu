@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_skill_workspace_skills_dir
-from app.db.models import AppSettings
+from app.db.models import AppSettings, User
 from app.skills import skill_registry
 
 
@@ -79,16 +79,42 @@ class SkillAdminService:
                 f"{source_label}skill archive is too large and exceeds the 5MB safety limit."
             )
 
-    def _get_or_create_settings(self, db: Session) -> AppSettings:
-        instance = db.scalar(select(AppSettings).limit(1))
+    def _resolve_user_id(self, db: Session, user: User | int | None) -> int:
+        if isinstance(user, User):
+            return int(user.id)
+        if isinstance(user, int):
+            return int(user)
+        instance = db.scalar(select(User).order_by(User.id.asc()).limit(1))
+        if instance is None:
+            raise RuntimeError("系统暂无可用用户，请先创建管理员。")
+        return int(instance.id)
+
+    def _get_or_create_settings(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> AppSettings:
+        user_id = self._resolve_user_id(db, user)
+        instance = db.scalar(
+            select(AppSettings).where(AppSettings.user_id == user_id).limit(1)
+        )
         if instance is None:
             from app.services.aniu_service import aniu_service
 
-            instance = aniu_service.get_or_create_settings(db)
+            try:
+                instance = aniu_service.get_or_create_settings(db, user_id)
+            except TypeError as exc:
+                if "positional" not in str(exc) and "argument" not in str(exc):
+                    raise
+                instance = aniu_service.get_or_create_settings(db)
         return instance
 
-    def _get_disabled_skill_ids(self, db: Session) -> set[str]:
-        settings = self._get_or_create_settings(db)
+    def _get_disabled_skill_ids(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> set[str]:
+        settings = self._get_or_create_settings(db, user)
         raw = str(settings.disabled_skill_ids_json or "[]").strip() or "[]"
         try:
             parsed = json.loads(raw)
@@ -103,8 +129,13 @@ class SkillAdminService:
             and not self._is_system_runtime(_normalize_skill_id(item))
         }
 
-    def _save_disabled_skill_ids(self, db: Session, disabled_ids: set[str]) -> None:
-        settings = self._get_or_create_settings(db)
+    def _save_disabled_skill_ids(
+        self,
+        db: Session,
+        disabled_ids: set[str],
+        user: User | int | None = None,
+    ) -> None:
+        settings = self._get_or_create_settings(db, user)
         persisted_ids = {
             skill_id for skill_id in disabled_ids if not self._is_system_runtime(skill_id)
         }
@@ -116,18 +147,30 @@ class SkillAdminService:
         db.commit()
         db.refresh(settings)
 
-    def _sync_persisted_state(self, db: Session) -> set[str]:
-        disabled_ids = self._get_disabled_skill_ids(db)
+    def _sync_persisted_state(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> set[str]:
+        disabled_ids = self._get_disabled_skill_ids(db, user)
         installed_ids = {pkg.id for pkg in skill_registry.all_packages()}
         skill_registry.set_disabled(disabled_ids & installed_ids)
         return disabled_ids
 
-    def apply_persisted_state(self, db: Session) -> None:
-        self._sync_persisted_state(db)
+    def apply_persisted_state(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> None:
+        self._sync_persisted_state(db, user)
 
-    def _reload_and_apply_state(self, db: Session) -> None:
+    def _reload_and_apply_state(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> None:
         skill_registry.reload()
-        self.apply_persisted_state(db)
+        self.apply_persisted_state(db, user)
 
     def _extract_run_types(self, pkg: Any) -> list[str]:
         return list(getattr(pkg, "run_types", []) or [])
@@ -261,8 +304,12 @@ class SkillAdminService:
             ),
         )
 
-    def list_skills(self, db: Session) -> list[dict[str, Any]]:
-        disabled_ids = self._sync_persisted_state(db)
+    def list_skills(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> list[dict[str, Any]]:
+        disabled_ids = self._sync_persisted_state(db, user)
         packages = self._sorted_packages()
         return [
             self._build_skill_list_item(
@@ -279,22 +326,35 @@ class SkillAdminService:
                 return pkg
         raise LookupError(f"Skill not found: {skill_id}")
 
-    def set_enabled(self, db: Session, *, skill_id: str, enabled: bool) -> dict[str, Any]:
+    def set_enabled(
+        self,
+        db: Session,
+        *,
+        user: User | int | None = None,
+        skill_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
         pkg = self._find_skill(skill_id)
         if not getattr(pkg, "can_disable", False):
             if not enabled:
                 raise ValueError("System runtime skills cannot be disabled.")
             return self._build_skill_info(pkg, enabled=bool(getattr(pkg, "always_enabled", True)))
-        disabled_ids = self._get_disabled_skill_ids(db)
+        disabled_ids = self._get_disabled_skill_ids(db, user)
         if enabled:
             disabled_ids.discard(pkg.id)
         else:
             disabled_ids.add(pkg.id)
-        self._save_disabled_skill_ids(db, disabled_ids)
-        self.apply_persisted_state(db)
+        self._save_disabled_skill_ids(db, disabled_ids, user)
+        self.apply_persisted_state(db, user)
         return self._build_skill_info(pkg, enabled=enabled)
 
-    def delete_skill(self, db: Session, *, skill_id: str) -> None:
+    def delete_skill(
+        self,
+        db: Session,
+        *,
+        user: User | int | None = None,
+        skill_id: str,
+    ) -> None:
         pkg = self._find_skill(skill_id)
         if not getattr(pkg, "can_delete", False):
             raise ValueError("Built-in skills cannot be deleted.")
@@ -306,17 +366,21 @@ class SkillAdminService:
         except ValueError as exc:
             raise ValueError("Only workspace skills inside the managed skill directory can be deleted.") from exc
 
-        disabled_ids = self._get_disabled_skill_ids(db)
+        disabled_ids = self._get_disabled_skill_ids(db, user)
         disabled_ids.discard(pkg.id)
-        self._save_disabled_skill_ids(db, disabled_ids)
+        self._save_disabled_skill_ids(db, disabled_ids, user)
 
         if target_dir.exists():
             shutil.rmtree(target_dir)
-        self._reload_and_apply_state(db)
+        self._reload_and_apply_state(db, user)
 
-    def reload(self, db: Session) -> list[dict[str, Any]]:
+    def reload(
+        self,
+        db: Session,
+        user: User | int | None = None,
+    ) -> list[dict[str, Any]]:
         skill_registry.reload()
-        disabled_ids = self._sync_persisted_state(db)
+        disabled_ids = self._sync_persisted_state(db, user)
         packages = self._sorted_packages()
         return [
             self._build_skill_list_item(
@@ -448,7 +512,12 @@ class SkillAdminService:
         shutil.copytree(source_root, target_dir)
 
 
-    def import_from_skillhub(self, db: Session, slug_or_url: str) -> dict[str, Any]:
+    def import_from_skillhub(
+        self,
+        db: Session,
+        slug_or_url: str,
+        user: User | int | None = None,
+    ) -> dict[str, Any]:
         slug, archive_bytes = self._download_skillhub_archive(slug_or_url)
         with tempfile.TemporaryDirectory() as temp_dir_name:
             temp_dir = Path(temp_dir_name)
@@ -456,7 +525,7 @@ class SkillAdminService:
             self._annotate_skillhub_metadata(source_root, slug=slug)
             self._install_from_source_root(skill_id=slug, source_root=source_root)
 
-        return self._finalize_import(db, skill_id=slug)
+        return self._finalize_import(db, user=user, skill_id=slug)
 
     def _resolve_clawhub_page_url(self, slug_or_url: str) -> tuple[str, str]:
         value = str(slug_or_url or "").strip()
@@ -601,23 +670,35 @@ class SkillAdminService:
             source_root = self._extract_archive_to_temp(archive_bytes, temp_dir)
             shutil.copytree(source_root, target_dir)
 
-    def _finalize_import(self, db: Session, *, skill_id: str) -> dict[str, Any]:
-        disabled_ids = self._get_disabled_skill_ids(db)
+    def _finalize_import(
+        self,
+        db: Session,
+        *,
+        user: User | int | None = None,
+        skill_id: str,
+    ) -> dict[str, Any]:
+        disabled_ids = self._get_disabled_skill_ids(db, user)
         disabled_ids.add(skill_id)
-        self._save_disabled_skill_ids(db, disabled_ids)
-        self._reload_and_apply_state(db)
+        self._save_disabled_skill_ids(db, disabled_ids, user)
+        self._reload_and_apply_state(db, user)
         pkg = self._find_skill(skill_id)
         return self._build_skill_info(pkg, enabled=False)
 
-    def import_from_clawhub(self, db: Session, slug_or_url: str) -> dict[str, Any]:
+    def import_from_clawhub(
+        self,
+        db: Session,
+        slug_or_url: str,
+        user: User | int | None = None,
+    ) -> dict[str, Any]:
         slug, archive_bytes = self._download_clawhub_archive(slug_or_url)
         self._install_archive(skill_id=slug, archive_bytes=archive_bytes)
-        return self._finalize_import(db, skill_id=slug)
+        return self._finalize_import(db, user=user, skill_id=slug)
 
     def import_from_zip(
         self,
         db: Session,
         *,
+        user: User | int | None = None,
         filename: str,
         archive_bytes: bytes,
     ) -> dict[str, Any]:
@@ -632,7 +713,7 @@ class SkillAdminService:
             )
 
         self._install_archive(skill_id=skill_id, archive_bytes=archive_bytes)
-        return self._finalize_import(db, skill_id=skill_id)
+        return self._finalize_import(db, user=user, skill_id=skill_id)
 
 
 skill_admin_service = SkillAdminService()

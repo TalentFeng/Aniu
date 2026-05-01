@@ -49,6 +49,7 @@ class AppSettingsRead(AppSettingsBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    user_id: int
     created_at: datetime
     updated_at: datetime
 
@@ -69,6 +70,50 @@ class AppSettingsRead(AppSettingsBase):
 
 class AppSettingsUpdate(AppSettingsBase):
     pass
+
+
+class UserSessionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: Literal["admin", "user"]
+    credit_balance: int
+    is_active: bool
+
+
+class UserRead(UserSessionRead):
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=6, max_length=128)
+    role: Literal["admin", "user"] = "user"
+    credit_balance: int = Field(default=0, ge=0)
+
+
+class AdminUserStatusUpdateRequest(BaseModel):
+    is_active: bool
+
+
+class CreditAdjustRequest(BaseModel):
+    amount: int
+    note: str | None = Field(default=None, max_length=255)
+
+
+class ModelPricingBase(BaseModel):
+    model_name: str = Field(min_length=1, max_length=128)
+    credit_cost: int = Field(ge=0)
+    is_active: bool = True
+
+
+class ModelPricingRead(ModelPricingBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    created_at: datetime
 
 
 class SkillListItemRead(BaseModel):
@@ -446,9 +491,11 @@ class PersistentSessionMessagesPageRead(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=1, max_length=64)
     password: str = Field(min_length=1)
 
 
 class LoginResponse(BaseModel):
     authenticated: bool
     token: str | None = None
+    user: UserSessionRead | None = None

@@ -3,9 +3,19 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.types import JSON
 
 from app.core.constants import DEFAULT_SYSTEM_PROMPT
 
@@ -14,23 +24,67 @@ class Base(DeclarativeBase):
     pass
 
 
-class AppSettings(Base):
-    __tablename__ = "app_settings"
+class User(Base):
+    __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    credit_balance: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    settings: Mapped["AppSettings | None"] = relationship(back_populates="user")
+    credit_transactions: Mapped[list["CreditTransaction"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+
+class CreditTransaction(Base):
+    __tablename__ = "credit_transactions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    balance_after: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(32), index=True)
+    related_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_runs.id"), nullable=True, index=True
+    )
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    user: Mapped[User] = relationship(back_populates="credit_transactions")
+
+
+class ModelPricing(Base):
+    __tablename__ = "model_pricing"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    model_name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    credit_cost: Mapped[int] = mapped_column(Integer, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class AppSettings(Base):
+    __tablename__ = "app_settings"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_app_settings_user_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     provider_name: Mapped[str] = mapped_column(String(32), default="openai-compatible")
     mx_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     llm_model: Mapped[str] = mapped_column(String(128), default="gpt-4o-mini")
-    disabled_skill_ids_json: Mapped[str] = mapped_column(
-        Text,
-        default="[]",
-    )
-    system_prompt: Mapped[str] = mapped_column(
-        Text,
-        default=DEFAULT_SYSTEM_PROMPT,
-    )
+    disabled_skill_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    system_prompt: Mapped[str] = mapped_column(Text, default=DEFAULT_SYSTEM_PROMPT)
     analyst_prompt: Mapped[str] = mapped_column(
         Text,
         default=(
@@ -51,9 +105,7 @@ class AppSettings(Base):
     automation_context_window_tokens: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=128000
     )
-    automation_recent_message_limit: Mapped[int] = mapped_column(
-        Integer, default=24
-    )
+    automation_recent_message_limit: Mapped[int] = mapped_column(Integer, default=24)
     automation_enable_auto_compaction: Mapped[bool] = mapped_column(
         Boolean, default=True
     )
@@ -85,11 +137,14 @@ class AppSettings(Base):
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
+    user: Mapped[User] = relationship(back_populates="settings")
+
 
 class StrategySchedule(Base):
     __tablename__ = "strategy_schedules"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     name: Mapped[str] = mapped_column(String(64), default="默认调度任务")
     run_type: Mapped[str] = mapped_column(String(32), default="analysis")
     interval_minutes: Mapped[int] = mapped_column(Integer, default=30)
@@ -111,6 +166,7 @@ class StrategyRun(Base):
     __tablename__ = "strategy_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     trigger_source: Mapped[str] = mapped_column(String(32), default="manual")
     run_type: Mapped[str] = mapped_column(String(32), default="analysis")
     schedule_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
@@ -150,6 +206,7 @@ class TradeOrder(Base):
     __tablename__ = "trade_orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("strategy_runs.id"), index=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     action: Mapped[str] = mapped_column(String(16))
@@ -165,8 +222,12 @@ class TradeOrder(Base):
 
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "slug", name="uq_chat_sessions_user_slug"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     title: Mapped[str] = mapped_column(String(120), default="新对话")
     kind: Mapped[str] = mapped_column(String(32), default="user", index=True)
     slug: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
@@ -198,6 +259,7 @@ class ChatMessageRecord(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     session_id: Mapped[int] = mapped_column(
         ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
     )
@@ -224,8 +286,11 @@ class ChatAttachment(Base):
     __tablename__ = "chat_attachments"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), default=1, index=True)
     filename: Mapped[str] = mapped_column(String(255))
-    mime_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
+    mime_type: Mapped[str] = mapped_column(
+        String(120), default="application/octet-stream"
+    )
     size: Mapped[int] = mapped_column(Integer, default=0)
     storage_path: Mapped[str] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
